@@ -1,7 +1,9 @@
+import { ObjectId } from "mongodb";
 import request from "supertest";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
 import { getStripe } from "../src/integrations/stripe/stripe.client.js";
+import { getDb } from "../src/lib/mongo.js";
 import { updateUser } from "../src/lib/user-repository.js";
 import {
   authorizationFor,
@@ -179,5 +181,165 @@ describe("vendor premium subscriptions", () => {
       .send(payload);
 
     expect(response.status).toBe(200);
+  });
+
+  it("marks a pending checkout as expired from a verified webhook without granting Premium", async () => {
+    const vendor = await createTestUser({ role: "vendor" });
+    await getDb().collection("transactions").insertOne({
+      vendorId: new ObjectId(vendor.id),
+      plan: "premium",
+      amount: 12,
+      currency: "USD",
+      status: "pending",
+      stripeSessionId: "cs_test_expired_1",
+      stripeSubscriptionId: null,
+      stripeInvoiceId: null,
+      paidAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const event = {
+      id: "evt_expired_1",
+      object: "event",
+      type: "checkout.session.expired",
+      data: {
+        object: {
+          id: "cs_test_expired_1",
+          object: "checkout.session",
+          mode: "subscription",
+          client_reference_id: vendor.id,
+          metadata: { vendorId: vendor.id },
+        },
+      },
+    };
+    const { payload, signature } = signedWebhook(event);
+
+    const response = await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload);
+
+    expect(response.status).toBe(200);
+
+    const tx = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_expired_1" });
+    expect(tx?.status).toBe("expired");
+
+    const status = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(vendor));
+    expect(status.body.plan).toBe("free");
+    expect(status.body.premiumActive).toBe(false);
+
+    // Idempotent replay: still expired, never paid/granted.
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+    const txAfter = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_expired_1" });
+    expect(txAfter?.status).toBe("expired");
+  });
+
+  it("marks a pending checkout as failed on async payment failure without granting Premium", async () => {
+    const vendor = await createTestUser({ role: "vendor" });
+    await getDb().collection("transactions").insertOne({
+      vendorId: new ObjectId(vendor.id),
+      plan: "premium",
+      amount: 12,
+      currency: "USD",
+      status: "pending",
+      stripeSessionId: "cs_test_async_failed_1",
+      stripeSubscriptionId: null,
+      stripeInvoiceId: null,
+      paidAt: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const event = {
+      id: "evt_async_failed_1",
+      object: "event",
+      type: "checkout.session.async_payment_failed",
+      data: {
+        object: {
+          id: "cs_test_async_failed_1",
+          object: "checkout.session",
+          mode: "subscription",
+          client_reference_id: vendor.id,
+          metadata: { vendorId: vendor.id },
+        },
+      },
+    };
+    const { payload, signature } = signedWebhook(event);
+
+    const response = await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload);
+
+    expect(response.status).toBe(200);
+
+    const tx = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_async_failed_1" });
+    expect(tx?.status).toBe("failed");
+
+    const status = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(vendor));
+    expect(status.body.plan).toBe("free");
+  });
+
+  it("does not downgrade a paid transaction when an expired event is replayed", async () => {
+    const vendor = await createTestUser({ role: "vendor" });
+    await getDb().collection("transactions").insertOne({
+      vendorId: new ObjectId(vendor.id),
+      plan: "premium",
+      amount: 12,
+      currency: "USD",
+      status: "paid",
+      stripeSessionId: "cs_test_paid_1",
+      stripeSubscriptionId: "sub_test_paid_1",
+      stripeInvoiceId: null,
+      paidAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    const event = {
+      id: "evt_expired_paid",
+      object: "event",
+      type: "checkout.session.expired",
+      data: {
+        object: {
+          id: "cs_test_paid_1",
+          object: "checkout.session",
+          mode: "subscription",
+          client_reference_id: vendor.id,
+          metadata: { vendorId: vendor.id },
+        },
+      },
+    };
+    const { payload, signature } = signedWebhook(event);
+
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+
+    const tx = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_paid_1" });
+    expect(tx?.status).toBe("paid");
   });
 });

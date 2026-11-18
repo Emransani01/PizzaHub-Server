@@ -1,6 +1,7 @@
 import request from "supertest";
 import { beforeEach, describe, expect, it } from "vitest";
 import { createApp } from "../src/app.js";
+import { OrderModel } from "../src/modules/orders/order.model.js";
 import {
   authorizationFor,
   clearDatabase,
@@ -51,6 +52,7 @@ function orderPayload(itemId: string, overrides: Record<string, unknown> = {}) {
 describe("orders", () => {
   beforeEach(async () => {
     await clearDatabase();
+    await OrderModel.syncIndexes();
   });
 
   it("lets a customer place an order without any payment step", async () => {
@@ -98,6 +100,27 @@ describe("orders", () => {
       .send(orderPayload(itemId));
 
     expect(duplicate.status).toBe(409);
+  });
+
+  it("prevents concurrent duplicate active orders for the same item and date at the database level", async () => {
+    const { itemId } = await seedApprovedItem();
+    const customer = await createTestUser({ role: "customer" });
+    const auth = await authorizationFor(customer);
+    const payload = orderPayload(itemId);
+
+    const [a, b] = await Promise.all([
+      request(app).post("/api/orders").set("Authorization", auth).send(payload),
+      request(app).post("/api/orders").set("Authorization", auth).send(payload),
+    ]);
+
+    const statuses = [a.status, b.status].sort();
+    expect(statuses).toEqual([201, 409]);
+
+    const count = await OrderModel.countDocuments({
+      itemId,
+      deliveryDate: new Date(`${payload.deliveryDate}T00:00:00.000Z`),
+    });
+    expect(count).toBe(1);
   });
 
   it("rejects past delivery dates and unknown items", async () => {

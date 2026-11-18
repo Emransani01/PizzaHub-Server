@@ -64,6 +64,20 @@ function startOfTodayUtc(): Date {
   );
 }
 
+function activeOrderKey(
+  customerId: string,
+  itemId: string,
+  deliveryDate: Date,
+): string {
+  return `${customerId}:${itemId}:${deliveryDate.toISOString().slice(0, 10)}`;
+}
+
+function isDuplicateActiveOrderError(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const e = error as { code?: number; keyPattern?: Record<string, unknown> };
+  return e.code === 11000 && Boolean(e.keyPattern?.activeOrderKey);
+}
+
 async function serialize(docs: OrderHydrated[]): Promise<OrderView[]> {
   const userIds = new Set<string>();
   for (const doc of docs) {
@@ -151,27 +165,38 @@ export async function createOrder(
     );
   }
 
-  const created = await OrderModel.create({
-    itemId: itemObjectId,
-    vendorId: item.vendorId,
-    customerId: new Types.ObjectId(customer.id),
-    itemName: item.itemName,
-    itemImage: item.images?.[0] ?? null,
-    itemPrice: item.price,
-    deliveryDate,
-    deliveryAddress: input.deliveryAddress,
-    message: input.message ?? null,
-    status: "pending" satisfies OrderStatus,
-    statusHistory: [
-      {
-        status: "pending" satisfies OrderStatus,
-        changedBy: new Types.ObjectId(customer.id),
-        changedByRole: "customer" satisfies UserRole,
-        changedAt: new Date(),
-        note: "Order placed",
-      },
-    ],
-  });
+  let created: OrderHydrated;
+  try {
+    created = await OrderModel.create({
+      itemId: itemObjectId,
+      vendorId: item.vendorId,
+      customerId: new Types.ObjectId(customer.id),
+      itemName: item.itemName,
+      itemImage: item.images?.[0] ?? null,
+      itemPrice: item.price,
+      deliveryDate,
+      deliveryAddress: input.deliveryAddress,
+      message: input.message ?? null,
+      status: "pending" satisfies OrderStatus,
+      activeOrderKey: activeOrderKey(customer.id, item._id.toString(), deliveryDate),
+      statusHistory: [
+        {
+          status: "pending" satisfies OrderStatus,
+          changedBy: new Types.ObjectId(customer.id),
+          changedByRole: "customer" satisfies UserRole,
+          changedAt: new Date(),
+          note: "Order placed",
+        },
+      ],
+    });
+  } catch (error) {
+    if (isDuplicateActiveOrderError(error)) {
+      throw ApiError.conflict(
+        "You already have an active order for this item on that delivery date.",
+      );
+    }
+    throw error;
+  }
 
   const [view] = await serialize([created]);
   return view;
@@ -290,6 +315,9 @@ export async function updateOrderStatus(
   };
 
   doc.status = status;
+  if (status === "rejected" || status === "cancelled") {
+    doc.activeOrderKey = null;
+  }
   doc.statusHistory = [...(doc.statusHistory ?? []), entry];
   await doc.save();
 

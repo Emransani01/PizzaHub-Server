@@ -20,6 +20,12 @@ export interface OrderDocument {
   deliveryAddress: string;
   message: string | null;
   status: OrderStatus;
+  /**
+   * Present only while the order is active (pending/accepted). Used by a
+   * partial unique index to prevent duplicate active orders for the same
+   * customer, item and delivery date at the database level.
+   */
+  activeOrderKey: string | null;
   statusHistory: OrderStatusEntry[];
   createdAt: Date;
   updatedAt: Date;
@@ -62,6 +68,7 @@ const orderSchema = new Schema<OrderDocument>(
       required: true,
       index: true,
     },
+    activeOrderKey: { type: String, default: null },
     statusHistory: { type: [statusEntrySchema], required: true, default: [] },
   },
   {
@@ -79,6 +86,13 @@ const orderSchema = new Schema<OrderDocument>(
 );
 
 orderSchema.index({ customerId: 1, itemId: 1, deliveryDate: 1, status: 1 });
+orderSchema.index(
+  { activeOrderKey: 1 },
+  {
+    unique: true,
+    partialFilterExpression: { activeOrderKey: { $type: "string" } },
+  },
+);
 orderSchema.index({ vendorId: 1, status: 1, createdAt: -1 });
 orderSchema.index({ customerId: 1, status: 1, createdAt: -1 });
 

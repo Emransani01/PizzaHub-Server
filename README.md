@@ -9,6 +9,12 @@ image uploads.
 Customer orders never touch Stripe. Stripe is used **only** for the optional
 Vendor Premium subscription.
 
+## Links
+
+- Live website URL: **TO BE FILLED AFTER DEPLOYMENT**
+- Client GitHub repository URL: **TO BE FILLED AFTER PUBLISHING (separate client repo)**
+- Server GitHub repository URL: **TO BE FILLED AFTER PUBLISHING (separate server repo)**
+
 ## Tech stack
 
 | Layer | Choice |
@@ -106,18 +112,17 @@ admin role.
 
 ## Authentication and authorization
 
-1. The browser talks to the Next.js app on the same origin; Next rewrites
-   `/api/*` to this server, so the Better Auth session cookie is first-party.
-2. `POST /api/auth/sign-up/email` and `POST /api/auth/sign-in/email` are handled
-   by Better Auth. The account always starts as `customer` with
-   `roleOnboarded: false`.
-3. `GET /api/auth/token` reads the HttpOnly session cookie and returns a
-   short-lived HS256 JWT plus the current profile. The browser keeps the token
-   in memory only and refreshes it when an API call answers `401`.
-4. Protected routes verify the JWT signature, issuer and audience, reload the
-   user from MongoDB, reject blocked accounts and only then apply role checks.
+### JWT verification middleware flow
 
-Authorization rules enforced on the server (never trusted from the client):
+1. **Session establishment (Better Auth):** the browser talks to the Next.js app on the same origin; Next rewrites `/api/*` to this server, so the Better Auth session cookie is first-party. `POST /api/auth/sign-up/email` and `POST /api/auth/sign-in/email` are handled by Better Auth. Public sign-up never creates an admin; new accounts start with `roleOnboarded: false`.
+2. **Access token issuance:** `GET /api/auth/token` reads the HttpOnly Better Auth session cookie, resolves the current account from MongoDB, rejects blocked accounts, and returns a short-lived HS256 JWT (default 15 minutes, signed with `JWT_SECRET`, issuer/audience `pizzahub`) plus the current profile. The client stores the token **in memory only**.
+3. **Client request:** protected API calls send `Authorization: Bearer <token>`. On `401` the client refreshes via `/api/auth/token` once (using the session cookie) and retries.
+4. **`authenticate` middleware (`src/middleware/authenticate.ts`):** extracts the bearer token, verifies JWT signature/issuer/audience/expiration via `jose`, reads `sub` (user id) and `role` claims, then **reloads the user from MongoDB** (`findUserById`) so role/block/subscription state is always current. Missing/invalid/expired token or unknown user → `401 Unauthorized`.
+5. **`checkBlockedUser` middleware:** rejects blocked accounts from protected operations with `403 Forbidden`.
+6. **`authorizeRole(...)` middleware:** enforces role membership (customer/vendor/admin) for the route → `403` when the authenticated role is not allowed.
+7. **Ownership/state checks in services:** controllers/services independently verify resource ownership (e.g. vendor owns menu item/order, customer owns order/favorites), allowed state transitions, duplicate/conflict rules, and validated input. Client-supplied user IDs/roles are never trusted for authorization decisions.
+
+Authorization outcomes enforced on the server (never trusted from the client):
 
 - Unknown/invalid/expired token → `401`.
 - Authenticated but wrong role, wrong owner, blocked account or disallowed
@@ -200,6 +205,26 @@ The six fixed categories are: `Classic Pizzas`, `Vegetarian Pizzas`,
 `Meat Lovers`, `Specialty / Gourmet Pizzas`, `Sides & Appetizers`,
 `Beverages & Desserts`.
 
+### Advanced search and sorting implementation
+
+The public menu endpoint (`GET /api/menu-items`) performs server-side search and
+filtering against MongoDB:
+
+- **Text/advanced search (`search`):** case-insensitive regex matching over
+  `itemName`, `description`, `category`, and `location`, so a single query can
+  find dishes by name, ingredients/description, cuisine category, or place.
+- **Filters:** exact `category` (one of the six fixed categories) and
+  case-insensitive `location` match.
+- **Sorting:** `sort=price_asc`, `sort=price_desc`, or `sort=newest` (default,
+  newest first).
+- **Visibility rule:** only `approved` and `isAvailable` items are returned in
+  public listings. Vendors/admins access non-public items through protected
+  owner/admin endpoints.
+- **Pagination:** `page` and `limit` (public cap 48) with `total`, `page`,
+  `limit`, and `totalPages` in the response. The client combines these controls
+  (search box, category/location filters, sort, pagination) for the Browse Menu
+  experience with loading/empty/error states.
+
 ### Orders
 
 | Method | Path | Access |
@@ -264,9 +289,14 @@ Returns `{ role, stats, series, recentOrders }`.
    the price ID into `STRIPE_PREMIUM_PRICE_ID`.
 2. Put the secret key in `STRIPE_SECRET_KEY`.
 3. Add a webhook endpoint pointing at
-   `<API_URL>/api/subscriptions/webhook` and subscribe to
-   `checkout.session.completed`, `checkout.session.expired` and
-   `checkout.session.async_payment_failed`.
+   `<API_URL>/api/subscriptions/webhook` and subscribe at minimum to:
+   - `checkout.session.completed` (activates Premium only after verification; idempotent)
+   - `checkout.session.expired` (marks pending checkout transaction `expired`, never grants Premium)
+   - `checkout.session.async_payment_failed` (marks pending checkout transaction `failed`, never grants Premium)
+   - `invoice.paid` (keeps subscription period/current state in sync)
+   - `invoice.payment_failed` (marks related pending subscription transactions failed)
+   - `customer.subscription.updated` (syncs active/expired plan state)
+   - `customer.subscription.deleted` (downgrades/cancels Premium)
 4. Copy the signing secret into `STRIPE_WEBHOOK_SECRET` and restart the API.
 5. Locally, forward events with the Stripe CLI:
 
@@ -274,9 +304,24 @@ Returns `{ role, stats, series, recentOrders }`.
    stripe listen --forward-to localhost:5000/api/subscriptions/webhook
    ```
 
+### Stripe test instructions
+
+- Use Stripe **test mode** keys/prices only. A common test card is
+  `4242 4242 4242 4242` with any future expiry, any CVC, and any postal code
+  (see Stripe docs for additional scenarios such as 3DS/declines).
+- Start checkout from the vendor dashboard subscription page; confirm you are
+  redirected to Stripe and back to `<CLIENT_ORIGIN>/payment-success` (or cancel).
+- Verify with the Stripe CLI/dashboard that webhook events reach
+  `<API_URL>/api/subscriptions/webhook` and that the transaction record is
+  created/updated only by verified events (frontend redirect never grants Premium).
+- To test expiry/failure handling, let a Checkout Session expire or trigger an
+  async payment failure in test mode and confirm the corresponding transaction
+  becomes `expired`/`failed` while the vendor remains non-premium.
+
 The webhook route is mounted **before** `express.json()` and uses the raw
 request body, because Stripe signatures are computed over the unparsed payload.
-Premium is granted only when the signature verifies and the session is real.
+Premium is granted only when the signature verifies and the session is real. Customer
+pizza orders never use Stripe.
 
 ## ImgBB setup
 

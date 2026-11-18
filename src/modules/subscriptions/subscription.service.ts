@@ -208,6 +208,30 @@ async function handleInvoiceFailed(invoice: Stripe.Invoice): Promise<void> {
   );
 }
 
+async function handleCheckoutExpired(
+  session: Stripe.Checkout.Session,
+): Promise<void> {
+  if (session.mode !== "subscription") return;
+
+  // Only the matching pending transaction may transition; paid records stay paid.
+  // Idempotent: repeated events become a no-op after the first state change.
+  await TransactionModel.findOneAndUpdate(
+    { stripeSessionId: session.id, status: "pending" },
+    { $set: { status: "expired" } },
+  );
+}
+
+async function handleCheckoutAsyncPaymentFailed(
+  session: Stripe.Checkout.Session,
+): Promise<void> {
+  if (session.mode !== "subscription") return;
+
+  await TransactionModel.findOneAndUpdate(
+    { stripeSessionId: session.id, status: "pending" },
+    { $set: { status: "failed" } },
+  );
+}
+
 async function handleSubscriptionChanged(
   subscription: Stripe.Subscription,
   deleted: boolean,
@@ -260,6 +284,16 @@ export async function handleStripeWebhook(
   switch (event.type) {
     case "checkout.session.completed":
       await handleCheckoutCompleted(
+        event.data.object as Stripe.Checkout.Session,
+      );
+      break;
+    case "checkout.session.expired":
+      await handleCheckoutExpired(
+        event.data.object as Stripe.Checkout.Session,
+      );
+      break;
+    case "checkout.session.async_payment_failed":
+      await handleCheckoutAsyncPaymentFailed(
         event.data.object as Stripe.Checkout.Session,
       );
       break;
