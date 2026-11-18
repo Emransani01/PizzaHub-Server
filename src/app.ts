@@ -1,3 +1,4 @@
+import type {} from "./types/express.js";
 import cors from "cors";
 import express, { type RequestHandler } from "express";
 import { env } from "./config/environment.js";
