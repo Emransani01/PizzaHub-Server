@@ -1,7 +1,27 @@
 import { betterAuth } from "better-auth";
+import { APIError, createAuthMiddleware } from "better-auth/api";
 import { mongodbAdapter } from "@better-auth/mongo-adapter";
 import { env } from "../config/environment.js";
 import { getDb, getMongoClient } from "./mongo.js";
+
+/**
+ * Better Auth only enforces a minimum length, so the stronger rule from the
+ * project brief (at least one uppercase and one lowercase letter) is checked
+ * before the account is created. The same rule is mirrored in the client form.
+ */
+const passwordPolicy = createAuthMiddleware(async (ctx) => {
+  if (ctx.path !== "/sign-up/email") return;
+
+  const body = ctx.body as { password?: unknown } | undefined;
+  const password = typeof body?.password === "string" ? body.password : "";
+
+  if (!/^(?=.*[a-z])(?=.*[A-Z]).{6,}$/.test(password)) {
+    throw new APIError("BAD_REQUEST", {
+      message:
+        "Password must be at least 6 characters long and include an uppercase and a lowercase letter.",
+    });
+  }
+});
 
 /**
  * Better Auth is created lazily so importing this module never opens a database
@@ -26,6 +46,9 @@ function createAuth() {
       enabled: true,
       minPasswordLength: 6,
       autoSignIn: true,
+    },
+    hooks: {
+      before: passwordPolicy,
     },
     socialProviders: env.google.enabled
       ? {
