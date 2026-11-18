@@ -1,4 +1,4 @@
-import { Schema, model, models, type Model, type Types } from "mongoose";
+import mongoose, { Schema, model, type Model, type Types } from "mongoose";
 import type { TransactionStatus } from "../../types/index.js";
 
 /**
@@ -53,5 +53,5 @@ const transactionSchema = new Schema<TransactionDocument>(
 );
 
 export const TransactionModel: Model<TransactionDocument> =
-  (models.Transaction as Model<TransactionDocument> | undefined) ??
+  (mongoose.models.Transaction as Model<TransactionDocument> | undefined) ??
   model<TransactionDocument>("Transaction", transactionSchema);

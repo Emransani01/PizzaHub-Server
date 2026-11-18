@@ -1,4 +1,4 @@
-import { Schema, model, models, type Model, type Types } from "mongoose";
+import mongoose, { Schema, model, type Model, type Types } from "mongoose";
 import { MENU_CATEGORIES } from "../../lib/categories.js";
 import type { MenuCategory, MenuItemStatus } from "../../types/index.js";
 
@@ -67,5 +67,5 @@ menuItemSchema.index({ status: 1, isAvailable: 1, createdAt: -1 });
 menuItemSchema.index({ itemName: "text", description: "text" });
 
 export const MenuItemModel: Model<MenuItemDocument> =
-  (models.MenuItem as Model<MenuItemDocument> | undefined) ??
+  (mongoose.models.MenuItem as Model<MenuItemDocument> | undefined) ??
   model<MenuItemDocument>("MenuItem", menuItemSchema);

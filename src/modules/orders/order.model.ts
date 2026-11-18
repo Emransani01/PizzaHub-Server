@@ -1,4 +1,4 @@
-import { Schema, model, models, type Model, type Types } from "mongoose";
+import mongoose, { Schema, model, type Model, type Types } from "mongoose";
 import type { OrderStatus, UserRole } from "../../types/index.js";
 
 export interface OrderStatusEntry {
@@ -83,5 +83,5 @@ orderSchema.index({ vendorId: 1, status: 1, createdAt: -1 });
 orderSchema.index({ customerId: 1, status: 1, createdAt: -1 });
 
 export const OrderModel: Model<OrderDocument> =
-  (models.Order as Model<OrderDocument> | undefined) ??
+  (mongoose.models.Order as Model<OrderDocument> | undefined) ??
   model<OrderDocument>("Order", orderSchema);
