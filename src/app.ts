@@ -2,6 +2,7 @@ import type {} from "./types/express.js";
 import cors from "cors";
 import express, { type RequestHandler } from "express";
 import { env } from "./config/environment.js";
+import { connectDatabase } from "./config/database.js";
 import { errorHandler } from "./middleware/error-handler.js";
 import { authHandler, issueTokenHandler } from "./routes/auth.routes.js";
 import configRoutes from "./modules/config/config.routes.js";
@@ -16,7 +17,10 @@ import uploadRoutes from "./modules/uploads/upload.routes.js";
 import userRoutes from "./modules/users/user.routes.js";
 
 const notFoundHandler: RequestHandler = (_req, res) => {
-  res.status(404).json({ message: "Route not found.", code: "NOT_FOUND" });
+  res.status(404).json({
+    message: "Route not found.",
+    code: "NOT_FOUND",
+  });
 };
 
 export function createApp() {
@@ -34,10 +38,23 @@ export function createApp() {
   );
 
   app.get("/health", (_req, res) => {
-    res.status(200).json({ status: "ok", uptime: process.uptime() });
+    res.status(200).json({
+      status: "ok",
+      uptime: process.uptime(),
+    });
   });
 
   app.use("/api/config", configRoutes);
+
+  // Ensure MongoDB is connected before database-dependent routes.
+  app.use(async (_req, _res, next) => {
+    try {
+      await connectDatabase();
+      next();
+    } catch (error) {
+      next(error);
+    }
+  });
 
   // The JWT endpoint must be registered before the Better Auth catch-all.
   app.get("/api/auth/token", issueTokenHandler);
