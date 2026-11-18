@@ -170,7 +170,7 @@ async function handleCheckoutCompleted(
         paidAt: new Date(),
       },
     },
-    { upsert: true, new: true },
+    { upsert: true, returnDocument: "after" },
   );
 
   await activatePremium(vendorId, {

@@ -210,7 +210,7 @@ async function main(): Promise<void> {
           rejectionReason: null,
         },
       },
-      { upsert: true, new: true },
+      { upsert: true, returnDocument: "after" },
     );
   }
 
