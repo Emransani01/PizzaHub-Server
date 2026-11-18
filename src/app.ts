@@ -44,6 +44,14 @@ export function createApp() {
     });
   });
 
+  app.get("/", (_req, res) => {
+    res.status(200).json({
+      name: "PizzaHub API",
+      status: "running",
+      message: "Welcome to PizzaHub Server",
+    });
+  });
+
   app.use("/api/config", configRoutes);
 
   // Ensure MongoDB is connected before database-dependent routes.
