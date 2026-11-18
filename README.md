@@ -45,7 +45,7 @@ cp .env.example .env        # Windows: copy .env.example .env
 npm run dev                 # http://localhost:5000
 ```
 
-Health check: `GET http://localhost:5000/api/health`.
+Health check: `GET http://localhost:5000/health`.
 
 ### Environment variables
 
