@@ -27,6 +27,54 @@ export async function getSubscriptionStatus(user: AppUser) {
   };
 }
 
+function isStripeResourceMissingError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "resource_missing"
+  );
+}
+
+async function getOrCreateStripeCustomer(
+  user: AppUser,
+  stripe: Stripe,
+): Promise<string> {
+  let customerId = user.stripeCustomerId;
+
+  if (customerId) {
+    try {
+      const existingCustomer = await stripe.customers.retrieve(customerId);
+
+      if ("deleted" in existingCustomer && existingCustomer.deleted) {
+        customerId = null;
+      }
+    } catch (error) {
+      if (isStripeResourceMissingError(error)) {
+        customerId = null;
+      } else {
+        throw error;
+      }
+    }
+  }
+
+  if (!customerId) {
+    const customer = await stripe.customers.create({
+      email: user.email,
+      name: user.businessName ?? user.name,
+      metadata: { vendorId: user.id },
+    });
+
+    customerId = customer.id;
+
+    await updateUser(user.id, {
+      stripeCustomerId: customerId,
+    });
+  }
+
+  return customerId;
+}
+
 export async function createCheckoutSession(user: AppUser) {
   if (user.role !== "vendor") {
     throw ApiError.forbidden("Only vendor accounts can subscribe to Premium.");
@@ -44,16 +92,7 @@ export async function createCheckoutSession(user: AppUser) {
 
   const stripe = getStripe();
 
-  let customerId = user.stripeCustomerId;
-  if (!customerId) {
-    const customer = await stripe.customers.create({
-      email: user.email,
-      name: user.businessName ?? user.name,
-      metadata: { vendorId: user.id },
-    });
-    customerId = customer.id;
-    await updateUser(user.id, { stripeCustomerId: customerId });
-  }
+  const customerId = await getOrCreateStripeCustomer(user, stripe);
 
   const session = await stripe.checkout.sessions.create({
     mode: "subscription",
@@ -87,10 +126,7 @@ export async function createCheckoutSession(user: AppUser) {
   return { url: session.url, sessionId: session.id };
 }
 
-export async function getCheckoutStatus(
-  user: AppUser,
-  sessionId: string,
-) {
+export async function getCheckoutStatus(user: AppUser, sessionId: string) {
   const transaction = await TransactionModel.findOne({
     stripeSessionId: sessionId,
   });
@@ -100,7 +136,9 @@ export async function getCheckoutStatus(
   }
 
   if (transaction.vendorId.toString() !== user.id) {
-    throw ApiError.forbidden("This checkout session belongs to another vendor.");
+    throw ApiError.forbidden(
+      "This checkout session belongs to another vendor.",
+    );
   }
 
   return {
@@ -133,7 +171,8 @@ async function handleCheckoutCompleted(
 ): Promise<void> {
   if (session.mode !== "subscription") return;
 
-  const vendorId = session.metadata?.vendorId ?? session.client_reference_id ?? null;
+  const vendorId =
+    session.metadata?.vendorId ?? session.client_reference_id ?? null;
   if (!vendorId) return;
 
   const existing = await TransactionModel.findOne({
@@ -147,7 +186,7 @@ async function handleCheckoutCompleted(
   const subscriptionId =
     typeof session.subscription === "string"
       ? session.subscription
-      : session.subscription?.id ?? null;
+      : (session.subscription?.id ?? null);
 
   let periodEnd: Date | null = null;
   if (subscriptionId) {
@@ -191,7 +230,8 @@ async function handleInvoicePaid(invoice: Stripe.Invoice): Promise<void> {
   let periodEnd: Date | null = null;
 
   if (subscriptionId) {
-    const subscription = await getStripe().subscriptions.retrieve(subscriptionId);
+    const subscription =
+      await getStripe().subscriptions.retrieve(subscriptionId);
     periodEnd = subscriptionPeriodEnd(subscription);
   }
 
@@ -288,9 +328,7 @@ export async function handleStripeWebhook(
       );
       break;
     case "checkout.session.expired":
-      await handleCheckoutExpired(
-        event.data.object as Stripe.Checkout.Session,
-      );
+      await handleCheckoutExpired(event.data.object as Stripe.Checkout.Session);
       break;
     case "checkout.session.async_payment_failed":
       await handleCheckoutAsyncPaymentFailed(
