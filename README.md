@@ -286,6 +286,9 @@ controls and explains why when the integration is not configured.
 
 ## Deployment notes
 
+- A Render blueprint is included as `render.yaml`. Point Render at this
+  repository, then fill in the variables it prompts for (all secrets are marked
+  `sync: false`, so no real value is stored in git).
 - Set `NODE_ENV=production` and every required variable in the hosting dashboard.
 - Use a dedicated Atlas database user with the minimum privileges needed.
 - Whitelist the hosting provider's egress IPs in Atlas (or use a VPC peering).
