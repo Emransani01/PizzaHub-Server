@@ -1,5 +1,9 @@
 import { Types } from "mongoose";
 import { env } from "../../config/environment.js";
+import {
+  activeMenuItemFilter,
+  inactiveMenuItemFilter,
+} from "../../lib/menu-status.js";
 import { countUsers } from "../../lib/user-repository.js";
 import type { AppUser, OrderStatus } from "../../types/index.js";
 import { MenuItemModel } from "../menu-items/menu-item.model.js";
@@ -80,18 +84,31 @@ async function weeklyOrderSeries(
 export async function getVendorOverview(user: AppUser) {
   const vendorId = new Types.ObjectId(user.id);
 
-  const [totalItems, approvedItems, pendingItems, rejectedItems, activeItems] =
-    await Promise.all([
-      MenuItemModel.countDocuments({ vendorId }),
-      MenuItemModel.countDocuments({ vendorId, status: "approved" }),
-      MenuItemModel.countDocuments({ vendorId, status: "pending" }),
-      MenuItemModel.countDocuments({ vendorId, status: "rejected" }),
-      MenuItemModel.countDocuments({
-        vendorId,
-        status: "approved",
-        isAvailable: true,
-      }),
-    ]);
+  const [
+    totalItems,
+    approvedItems,
+    pendingItems,
+    rejectedItems,
+    activeItems,
+    inactiveItems,
+  ] = await Promise.all([
+    MenuItemModel.countDocuments({ vendorId }),
+    MenuItemModel.countDocuments({
+      vendorId,
+      ...activeMenuItemFilter(),
+    }),
+    MenuItemModel.countDocuments({ vendorId, status: "pending" }),
+    MenuItemModel.countDocuments({ vendorId, status: "rejected" }),
+    MenuItemModel.countDocuments({
+      vendorId,
+      status: "approved",
+      isAvailable: true,
+    }),
+    MenuItemModel.countDocuments({
+      vendorId,
+      ...inactiveMenuItemFilter(),
+    }),
+  ]);
 
   const orderMatch = { vendorId };
   const orders = await orderStatusBreakdown(orderMatch);
@@ -106,6 +123,7 @@ export async function getVendorOverview(user: AppUser) {
       pendingItems,
       rejectedItems,
       activeItems,
+      inactiveItems,
       activeItemLimit: env.freePlanActiveItemLimit,
       totalOrders: Object.values(orders).reduce((sum, value) => sum + value, 0),
       orders,
@@ -150,6 +168,7 @@ export async function getAdminOverview() {
     pendingItems,
     approvedItems,
     rejectedItems,
+    inactiveItems,
     orders,
     transactionSummary,
   ] = await Promise.all([
@@ -160,8 +179,9 @@ export async function getAdminOverview() {
     countUsers({ isBlocked: true }),
     MenuItemModel.countDocuments({}),
     MenuItemModel.countDocuments({ status: "pending" }),
-    MenuItemModel.countDocuments({ status: "approved" }),
+    MenuItemModel.countDocuments(activeMenuItemFilter()),
     MenuItemModel.countDocuments({ status: "rejected" }),
+    MenuItemModel.countDocuments(inactiveMenuItemFilter()),
     orderStatusBreakdown({}),
     TransactionModel.aggregate<{ _id: null; total: number; count: number }>([
       { $match: { status: "paid" } },
@@ -191,6 +211,7 @@ export async function getAdminOverview() {
       pendingItems,
       approvedItems,
       rejectedItems,
+      inactiveItems,
       totalOrders: Object.values(orders).reduce((sum, value) => sum + value, 0),
       orders,
       paidTransactions,

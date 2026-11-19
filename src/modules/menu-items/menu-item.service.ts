@@ -2,13 +2,20 @@ import { Types, type HydratedDocument } from "mongoose";
 import { env } from "../../config/environment.js";
 import { ApiError } from "../../lib/api-error.js";
 import { MENU_CATEGORIES } from "../../lib/categories.js";
+import {
+  activeMenuItemFilter,
+  displayMenuItemStatus,
+  inactiveMenuItemFilter,
+  isMenuItemPublic,
+  isPausedMenuItem,
+} from "../../lib/menu-status.js";
 import { toObjectId } from "../../lib/object-id.js";
 import {
   findPremiumVendorIds,
   findUserById,
   findUsersByIds,
 } from "../../lib/user-repository.js";
-import type { AppUser } from "../../types/index.js";
+import type { AppUser, MenuItemStatus } from "../../types/index.js";
 import { OrderModel } from "../orders/order.model.js";
 import { MenuItemModel, type MenuItemDocument } from "./menu-item.model.js";
 import type {
@@ -32,7 +39,7 @@ export interface MenuItemView {
   price: number;
   location: string;
   images: string[];
-  status: string;
+  status: MenuItemStatus;
   isAvailable: boolean;
   rejectionReason: string | null;
   createdAt: string | null;
@@ -72,7 +79,7 @@ async function serialize(
       price: doc.price,
       location: doc.location,
       images: doc.images ?? [],
-      status: doc.status,
+      status: displayMenuItemStatus(doc.status, doc.isAvailable),
       isAvailable: doc.isAvailable,
       rejectionReason: doc.rejectionReason ?? null,
       createdAt: doc.createdAt?.toISOString() ?? null,
@@ -93,10 +100,7 @@ async function serializeOne(doc: MenuItemHydrated): Promise<MenuItemView> {
 }
 
 function buildPublicFilter(query: PublicMenuQuery) {
-  const filter: Record<string, unknown> = {
-    status: "approved",
-    isAvailable: true,
-  };
+  const filter: Record<string, unknown> = { ...activeMenuItemFilter() };
 
   if (query.search) {
     const pattern = new RegExp(escapeRegex(query.search), "i");
@@ -147,7 +151,7 @@ export async function listFeaturedMenuItems(limit = 8): Promise<MenuItemView[]> 
     .map((id) => toObjectId(id))
     .filter((value): value is Types.ObjectId => value !== null);
 
-  const base = { status: "approved", isAvailable: true } as const;
+  const base = activeMenuItemFilter();
 
   const featured: MenuItemHydrated[] = [];
 
@@ -181,7 +185,7 @@ export async function getCategoryCounts(): Promise<
   { category: string; count: number }[]
 > {
   const rows = await MenuItemModel.aggregate<{ _id: string; count: number }>([
-    { $match: { status: "approved", isAvailable: true } },
+    { $match: activeMenuItemFilter() },
     { $group: { _id: "$category", count: { $sum: 1 } } },
   ]);
 
@@ -194,10 +198,7 @@ export async function getCategoryCounts(): Promise<
 }
 
 export async function listLocations(): Promise<string[]> {
-  const values = await MenuItemModel.distinct("location", {
-    status: "approved",
-    isAvailable: true,
-  });
+  const values = await MenuItemModel.distinct("location", activeMenuItemFilter());
   return values.filter((value): value is string => typeof value === "string").sort();
 }
 
@@ -212,10 +213,23 @@ export async function listVendorMenuItems(
   return serialize(docs);
 }
 
+function adminStatusCondition(status?: MenuItemStatus): Record<string, unknown> {
+  if (status === "inactive") return inactiveMenuItemFilter();
+
+  // Serialised "approved" items are active; legacy paused items are reported
+  // through the "inactive" filter above.
+  if (status === "approved") {
+    return activeMenuItemFilter();
+  }
+
+  return { status };
+}
+
 export async function listAdminMenuItems(query: AdminMenuQuery) {
   const filter: Record<string, unknown> = {};
+  const conditions: Record<string, unknown>[] = [];
 
-  if (query.status) filter.status = query.status;
+  if (query.status) conditions.push(adminStatusCondition(query.status));
 
   if (query.category) filter.category = query.category;
 
@@ -228,13 +242,17 @@ export async function listAdminMenuItems(query: AdminMenuQuery) {
   }
 
   if (query.location) {
-    filter.location = new RegExp(`^${escapeRegex(query.location)}$`, "i");
+    conditions.push({
+      location: new RegExp(`^${escapeRegex(query.location)}$`, "i"),
+    });
   }
 
   if (query.search) {
     const pattern = new RegExp(escapeRegex(query.search), "i");
-    filter.$or = [{ itemName: pattern }, { description: pattern }];
+    conditions.push({ $or: [{ itemName: pattern }, { description: pattern }] });
   }
+
+  if (conditions.length > 0) filter.$and = conditions;
 
   const skip = (query.page - 1) * query.limit;
 
@@ -273,7 +291,11 @@ export async function getMenuItemForViewer(
     viewer !== undefined && doc.vendorId.toString() === viewer.id;
   const isAdmin = viewer?.role === "admin";
 
-  if (!isAdmin && !isOwner && !(doc.status === "approved" && doc.isAvailable)) {
+  if (
+    !isAdmin &&
+    !isOwner &&
+    !isMenuItemPublic(doc.status, doc.isAvailable)
+  ) {
     throw ApiError.notFound("Menu item not found.");
   }
 
@@ -367,10 +389,10 @@ export async function updateMenuItem(
 
   if (
     input.isAvailable === true &&
-    doc.isAvailable === false &&
-    isOwner
+    !doc.isAvailable &&
+    (doc.status === "approved" || doc.status === "inactive")
   ) {
-    const vendor = await findUserById(actor.id);
+    const vendor = await findUserById(doc.vendorId.toString());
     if (vendor) {
       await assertActiveItemCapacity(vendor, objectId);
     }
@@ -387,11 +409,18 @@ export async function updateMenuItem(
 
   if (input.isAvailable !== undefined) {
     doc.isAvailable = input.isAvailable;
+    if (doc.status === "approved" || doc.status === "inactive") {
+      doc.status = input.isAvailable ? "approved" : "inactive";
+    }
   }
 
-  // A vendor editing approved content must be reviewed again so approval can
-  // never be used to smuggle in different content after the fact.
-  if (contentChanged && isOwner && doc.status === "approved") {
+  // A vendor editing approved or paused content must be reviewed again so
+  // approval can never be used to smuggle in different content after the fact.
+  if (
+    contentChanged &&
+    isOwner &&
+    (doc.status === "approved" || doc.status === "inactive")
+  ) {
     doc.status = "pending";
     doc.rejectionReason = null;
   }
@@ -402,7 +431,7 @@ export async function updateMenuItem(
 
 export async function setMenuItemStatus(
   id: string,
-  status: "pending" | "approved" | "rejected",
+  status: MenuItemStatus,
   reason?: string,
 ): Promise<MenuItemView> {
   const objectId = toObjectId(id);
@@ -422,10 +451,20 @@ export async function setMenuItemStatus(
         "The vendor account for this item no longer exists.",
       );
     }
-    if (doc.isAvailable) {
+    // Admin approval publishes paused and rejected items again. A pending item
+    // that the vendor deliberately created unavailable keeps that choice, so it
+    // still does not consume the free-plan active-item allowance.
+    const shouldReactivate =
+      isPausedMenuItem(doc.status, doc.isAvailable) || doc.status === "rejected";
+    const willBeAvailable = doc.isAvailable || shouldReactivate;
+
+    if (willBeAvailable) {
       await assertActiveItemCapacity(vendor, objectId);
     }
+    if (shouldReactivate) doc.isAvailable = true;
   }
+
+  if (status === "inactive") doc.isAvailable = false;
 
   doc.status = status;
   doc.rejectionReason = status === "rejected" ? (reason ?? null) : null;

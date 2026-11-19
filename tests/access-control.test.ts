@@ -40,6 +40,36 @@ describe("access control", () => {
     expect(response.status).toBe(401);
   });
 
+  it("returns 401 for a correctly signed but expired token", async () => {
+    const { SignJWT } = await import("jose");
+    const customer = await createTestUser({ role: "customer" });
+
+    const expired = await new SignJWT({ role: "customer" })
+      .setProtectedHeader({ alg: "HS256", typ: "JWT" })
+      .setSubject(customer.id)
+      .setIssuer("pizzahub-api")
+      .setAudience("pizzahub-client")
+      .setIssuedAt(new Date(Date.now() - 10 * 60 * 1000))
+      .setExpirationTime(new Date(Date.now() - 5 * 60 * 1000))
+      .sign(new TextEncoder().encode(process.env.JWT_SECRET ?? ""));
+
+    const response = await request(app)
+      .get("/api/users/me")
+      .set("Authorization", `Bearer ${expired}`);
+
+    expect(response.status).toBe(401);
+    expect(response.body.message).toContain("expired");
+  });
+
+  it("returns 401 for a malformed Bearer token", async () => {
+    const response = await request(app)
+      .get("/api/users/me")
+      .set("Authorization", "Bearer not-a-jwt");
+
+    expect(response.status).toBe(401);
+    expect(response.body.message).toContain("Invalid or expired");
+  });
+
   it("returns 403 for a blocked account", async () => {
     const blocked = await createTestUser({ role: "customer", isBlocked: true });
 

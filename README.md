@@ -11,9 +11,10 @@ Vendor Premium subscription.
 
 ## Links
 
-- Live website URL: **TO BE FILLED AFTER DEPLOYMENT**
-- Client GitHub repository URL: **TO BE FILLED AFTER PUBLISHING (separate client repo)**
-- Server GitHub repository URL: **TO BE FILLED AFTER PUBLISHING (separate server repo)**
+- Live client website URL: **PENDING DEPLOYMENT — no verified live URL yet**
+- Live API deployment: <https://pizza-hub-server.vercel.app>
+- Client GitHub repository URL: <https://github.com/Emransani01/PizzaHub-Client>
+- Server GitHub repository URL: <https://github.com/Emransani01/PizzaHub-Server>
 
 ## Tech stack
 
@@ -114,8 +115,8 @@ admin role.
 
 ### JWT verification middleware flow
 
-1. **Session establishment (Better Auth):** the browser talks to the Next.js app on the same origin; Next rewrites `/api/*` to this server, so the Better Auth session cookie is first-party. `POST /api/auth/sign-up/email` and `POST /api/auth/sign-in/email` are handled by Better Auth. Public sign-up never creates an admin; new accounts start with `roleOnboarded: false`.
-2. **Access token issuance:** `GET /api/auth/token` reads the HttpOnly Better Auth session cookie, resolves the current account from MongoDB, rejects blocked accounts, and returns a short-lived HS256 JWT (default 15 minutes, signed with `JWT_SECRET`, issuer/audience `pizzahub`) plus the current profile. The client stores the token **in memory only**.
+1. **Session establishment (Better Auth):** the separately deployed Next.js client proxies same-origin `/api/*` requests to this deployed API through the rewrite configured from `API_URL` (see `client/next.config.ts`). The browser only talks to the client origin, so the Better Auth session cookie stays first-party. This server owns the Better Auth routes and MongoDB session data. `POST /api/auth/sign-up/email` and `POST /api/auth/sign-in/email` are handled here. Public sign-up never creates an admin; new accounts start with `roleOnboarded: false`.
+2. **Access token issuance:** `GET /api/auth/token` reads the HttpOnly Better Auth session cookie, resolves the current account from MongoDB, rejects blocked accounts, and returns a short-lived HS256 JWT (default 15 minutes, signed with `JWT_SECRET`, issuer `pizzahub-api`, audience `pizzahub-client`) plus the current profile. The client stores the token **in memory only**.
 3. **Client request:** protected API calls send `Authorization: Bearer <token>`. On `401` the client refreshes via `/api/auth/token` once (using the session cookie) and retries.
 4. **`authenticate` middleware (`src/middleware/authenticate.ts`):** extracts the bearer token, verifies JWT signature/issuer/audience/expiration via `jose`, reads `sub` (user id) and `role` claims, then **reloads the user from MongoDB** (`findUserById`) so role/block/subscription state is always current. Missing/invalid/expired token or unknown user → `401 Unauthorized`.
 5. **`checkBlockedUser` middleware:** rejects blocked accounts from protected operations with `403 Forbidden`.
@@ -140,21 +141,33 @@ accepts only `customer` or `vendor`, and only once (`roleOnboarded` must be
 | --- | --- |
 | `customer` | Browse the public menu, place orders, cancel pending orders, manage favourites, view own orders. |
 | `vendor` | Create/edit/delete own menu items, toggle availability, accept or reject incoming orders, view own transactions, subscribe to Premium. |
-| `admin` | Approve/reject menu items, block/unblock customers and vendors, read all transactions (read-only). |
+| `admin` | Approve/reject/deactivate and reactivate menu items, block/unblock customers and vendors, read all transactions (read-only). |
 
 ## Free vs Premium vendors
 
 - Free vendors may have at most **3** menu items that are simultaneously
-  `approved` **and** `isAvailable`. Pending and rejected items do not count.
-- The limit is enforced inside the create/update/approval transaction, not in
-  the UI.
+  `approved` **and** `isAvailable`. Pending, rejected and inactive items do not
+  count.
+- The limit is enforced on the server when an admin approves an item and when a
+  paused approved item is re-enabled; new items start as `pending`, so creation
+  cannot bypass it. It is not enforced in the UI.
 - Vendor Premium removes the limit. Premium is activated **only** by the
   Stripe webhook after signature verification; a frontend redirect to
   `/payment-success` never grants it.
-- Editing the content of an approved item (name, category, description, price,
-  location, images) resets its status to `pending` for re-approval.
-  Availability-only edits keep the approval.
-- Items with existing orders cannot be deleted (`409`); mark them unavailable
+- Menu-item statuses are `pending`, `approved`, `rejected` and `inactive`.
+  Availability changes on approved items move them between `approved` and
+  `inactive`; admins can also set `inactive` explicitly. Existing documents that
+  store `approved + isAvailable:false` are reported as `inactive` by the API, so
+  no database migration is required. The admin `status=approved` filter returns
+  only currently active items; legacy paused documents appear under
+  `status=inactive`.
+- When the **owning vendor** edits the content of an approved or inactive item
+  (name, category, description, price, location, images), its status resets to
+  `pending` for re-approval. Admin content edits keep the current status.
+  Availability-only edits do not require re-approval after the item is restored.
+- Only `approved` and available items are public or orderable; rejected and
+  inactive items are hidden.
+- Items with existing orders cannot be deleted (`409`); mark them inactive
   instead.
 
 ## API overview
@@ -195,11 +208,11 @@ All endpoints are prefixed with `/api`. JSON in, JSON out.
 | `POST` | `/menu-items` | vendor (created as `pending`) |
 | `PATCH` | `/menu-items/:id` | owning vendor, or admin |
 | `DELETE` | `/menu-items/:id` | owning vendor, or admin (blocked when orders exist) |
-| `GET` | `/menu-items/admin?status=&vendorId=&search=&category=&page=&limit=` | admin |
-| `PATCH` | `/menu-items/:id/status` | admin (`{ "status": "approved" \| "rejected" \| "pending", "reason": "..." }`) |
+| `GET` | `/menu-items/admin?status=&vendorId=&search=&category=&location=&page=&limit=` | admin |
+| `PATCH` | `/menu-items/:id/status` | admin (`{ "status": "approved" \| "rejected" \| "pending" \| "inactive", "reason": "..." }`) |
 
 `sort` is one of `newest`, `price_asc`, `price_desc`. `limit` is capped at 48
-for the public list and 50 for admin/user lists.
+for public and admin menu lists; user/order/transaction lists cap it at 50.
 
 The six fixed categories are: `Classic Pizzas`, `Vegetarian Pizzas`,
 `Meat Lovers`, `Specialty / Gourmet Pizzas`, `Sides & Appetizers`,
@@ -211,15 +224,19 @@ The public menu endpoint (`GET /api/menu-items`) performs server-side search and
 filtering against MongoDB:
 
 - **Text/advanced search (`search`):** case-insensitive regex matching over
-  `itemName`, `description`, `category`, and `location`, so a single query can
-  find dishes by name, ingredients/description, cuisine category, or place.
+  `itemName` and `description`, so a single query can find dishes by name or
+  description/ingredients.
 - **Filters:** exact `category` (one of the six fixed categories) and
-  case-insensitive `location` match.
+  case-insensitive exact `location` match. These are separate from `search`.
 - **Sorting:** `sort=price_asc`, `sort=price_desc`, or `sort=newest` (default,
   newest first).
 - **Visibility rule:** only `approved` and `isAvailable` items are returned in
-  public listings. Vendors/admins access non-public items through protected
-  owner/admin endpoints.
+  public listings or accepted by the order endpoint. `rejected` and `inactive`
+  items (including legacy `approved + isAvailable:false` documents) are hidden.
+  Vendors/admins access non-public items through protected owner/admin endpoints.
+- **Admin status filter:** `status` accepts `pending`, `approved`, `rejected` or
+  `inactive`; the `inactive` filter matches both stored `inactive` rows and the
+  legacy unavailable shape.
 - **Pagination:** `page` and `limit` (public cap 48) with `total`, `page`,
   `limit`, and `totalPages` in the response. The client combines these controls
   (search box, category/location filters, sort, pagination) for the Browse Menu
@@ -331,9 +348,11 @@ controls and explains why when the integration is not configured.
 
 ## Deployment notes
 
-- A Render blueprint is included as `render.yaml`. Point Render at this
-  repository, then fill in the variables it prompts for (all secrets are marked
-  `sync: false`, so no real value is stored in git).
+- The current API deployment is on Vercel at
+  <https://pizza-hub-server.vercel.app>; health and public API routes are live.
+  A Render blueprint is also included as `render.yaml` as an alternative. Point
+  Render at this repository, then fill in the variables it prompts for (all
+  secrets are marked `sync: false`, so no real value is stored in git).
 - Set `NODE_ENV=production` and every required variable in the hosting dashboard.
 - Use a dedicated Atlas database user with the minimum privileges needed.
 - Whitelist the hosting provider's egress IPs in Atlas (or use a VPC peering).

@@ -1,6 +1,6 @@
 import { ObjectId } from "mongodb";
 import request from "supertest";
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import { getStripe } from "../src/integrations/stripe/stripe.client.js";
 import { getDb } from "../src/lib/mongo.js";
@@ -49,9 +49,55 @@ function subscriptionEvent(
   };
 }
 
+function checkoutSessionEvent(
+  type: string,
+  session: Record<string, unknown>,
+) {
+  return {
+    id: `evt_${Math.random().toString(36).slice(2)}`,
+    object: "event",
+    type,
+    data: { object: session },
+  };
+}
+
+async function insertPendingTransaction(vendorId: string, sessionId: string) {
+  await getDb().collection("transactions").insertOne({
+    vendorId: new ObjectId(vendorId),
+    plan: "premium",
+    amount: 12,
+    currency: "USD",
+    status: "pending",
+    stripeSessionId: sessionId,
+    stripeSubscriptionId: null,
+    stripeInvoiceId: null,
+    paidAt: null,
+    createdAt: new Date(),
+    updatedAt: new Date(),
+  });
+}
+
+function mockSubscriptionRetrieve(periodEnd: number) {
+  return vi
+    .spyOn(getStripe().subscriptions, "retrieve")
+    .mockResolvedValue({
+      id: "sub_test_123",
+      object: "subscription",
+      status: "active",
+      items: {
+        object: "list",
+        data: [{ id: "si_1", current_period_end: periodEnd }],
+      },
+    } as never);
+}
+
 describe("vendor premium subscriptions", () => {
   beforeEach(async () => {
     await clearDatabase();
+  });
+
+  afterEach(() => {
+    vi.restoreAllMocks();
   });
 
   it("refuses checkout for non-vendor accounts", async () => {
@@ -341,5 +387,282 @@ describe("vendor premium subscriptions", () => {
       .collection("transactions")
       .findOne({ stripeSessionId: "cs_test_paid_1" });
     expect(tx?.status).toBe("paid");
+  });
+
+  it("does not grant Premium for an unpaid checkout session", async () => {
+    const vendor = await createTestUser({ role: "vendor" });
+    await insertPendingTransaction(vendor.id, "cs_test_unpaid_1");
+    const retrieve = mockSubscriptionRetrieve(1_900_000_000);
+
+    const session = {
+      id: "cs_test_unpaid_1",
+      object: "checkout.session",
+      mode: "subscription",
+      payment_status: "unpaid",
+      client_reference_id: vendor.id,
+      metadata: { vendorId: vendor.id },
+      customer: "cus_unpaid_1",
+      subscription: "sub_unpaid_1",
+      amount_total: 1200,
+      currency: "usd",
+    };
+    const { payload, signature } = signedWebhook(
+      checkoutSessionEvent("checkout.session.completed", session),
+    );
+
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+
+    const tx = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_unpaid_1" });
+    expect(tx?.status).toBe("pending");
+    expect(retrieve).not.toHaveBeenCalled();
+
+    const status = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(vendor));
+    expect(status.body.plan).toBe("free");
+    expect(status.body.premiumActive).toBe(false);
+  });
+
+  it("activates Premium from a paid async checkout success only once", async () => {
+    const vendor = await createTestUser({ role: "vendor" });
+    await updateUser(vendor.id, { stripeCustomerId: "cus_async_success_1" });
+    await insertPendingTransaction(vendor.id, "cs_test_async_success_1");
+    const periodEnd = 1_900_000_000;
+    const retrieve = mockSubscriptionRetrieve(periodEnd);
+
+    const session = {
+      id: "cs_test_async_success_1",
+      object: "checkout.session",
+      mode: "subscription",
+      payment_status: "paid",
+      client_reference_id: vendor.id,
+      metadata: { vendorId: vendor.id },
+      customer: "cus_async_success_1",
+      subscription: "sub_async_success_1",
+      amount_total: 1200,
+      currency: "usd",
+    };
+    const { payload, signature } = signedWebhook(
+      checkoutSessionEvent("checkout.session.async_payment_succeeded", session),
+    );
+
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+
+    const tx = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_async_success_1" });
+    expect(tx?.status).toBe("paid");
+    expect(tx?.stripeSubscriptionId).toBe("sub_async_success_1");
+    expect(retrieve).toHaveBeenCalledTimes(1);
+
+    const status = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(vendor));
+    expect(status.body.plan).toBe("premium");
+    expect(status.body.premiumActive).toBe(true);
+    expect(status.body.expiresAt).toBe(new Date(periodEnd * 1000).toISOString());
+
+    // Replay the async success and a related completed event: neither may
+    // repeat the Stripe read, extend the subscription, or duplicate the payment.
+    const completed = signedWebhook(
+      checkoutSessionEvent("checkout.session.completed", session),
+    );
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", completed.signature)
+      .send(completed.payload)
+      .expect(200);
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+
+    expect(retrieve).toHaveBeenCalledTimes(1);
+    const transactions = await getDb()
+      .collection("transactions")
+      .find({ stripeSessionId: "cs_test_async_success_1" })
+      .toArray();
+    expect(transactions).toHaveLength(1);
+    expect(transactions[0]?.status).toBe("paid");
+  });
+
+  it("refuses a paid checkout whose transaction belongs to another vendor", async () => {
+    const owner = await createTestUser({ role: "vendor" });
+    const other = await createTestUser({ role: "vendor" });
+    await insertPendingTransaction(owner.id, "cs_test_wrong_owner_1");
+    const retrieve = mockSubscriptionRetrieve(1_900_000_000);
+
+    const session = {
+      id: "cs_test_wrong_owner_1",
+      object: "checkout.session",
+      mode: "subscription",
+      payment_status: "paid",
+      client_reference_id: other.id,
+      metadata: { vendorId: other.id },
+      subscription: "sub_wrong_owner_1",
+      amount_total: 1200,
+      currency: "usd",
+    };
+    const { payload, signature } = signedWebhook(
+      checkoutSessionEvent("checkout.session.completed", session),
+    );
+
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+
+    const tx = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_wrong_owner_1" });
+    expect(tx?.status).toBe("pending");
+    expect(tx?.vendorId.toString()).toBe(owner.id);
+    expect(retrieve).not.toHaveBeenCalled();
+
+    const ownerStatus = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(owner));
+    const otherStatus = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(other));
+    expect(ownerStatus.body.plan).toBe("free");
+    expect(otherStatus.body.plan).toBe("free");
+  });
+
+  it("refuses a paid checkout for a Stripe customer owned by another vendor", async () => {
+    const vendor = await createTestUser({ role: "vendor" });
+    const other = await createTestUser({ role: "vendor" });
+    await updateUser(vendor.id, { stripeCustomerId: "cus_vendor_owner_1" });
+    await updateUser(other.id, { stripeCustomerId: "cus_other_vendor_1" });
+    await insertPendingTransaction(vendor.id, "cs_test_wrong_customer_1");
+    const retrieve = mockSubscriptionRetrieve(1_900_000_000);
+
+    const session = {
+      id: "cs_test_wrong_customer_1",
+      object: "checkout.session",
+      mode: "subscription",
+      payment_status: "paid",
+      client_reference_id: vendor.id,
+      metadata: { vendorId: vendor.id },
+      customer: "cus_other_vendor_1",
+      subscription: "sub_wrong_customer_1",
+      amount_total: 1200,
+      currency: "usd",
+    };
+    const { payload, signature } = signedWebhook(
+      checkoutSessionEvent("checkout.session.completed", session),
+    );
+
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+
+    const tx = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_wrong_customer_1" });
+    expect(tx?.status).toBe("pending");
+    expect(retrieve).not.toHaveBeenCalled();
+
+    const vendorStatus = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(vendor));
+    const otherStatus = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(other));
+    expect(vendorStatus.body.plan).toBe("free");
+    expect(otherStatus.body.plan).toBe("free");
+  });
+
+  it("ignores a paid webhook event whose object is not a Checkout Session", async () => {
+    const vendor = await createTestUser({ role: "vendor" });
+
+    const event = {
+      id: "evt_wrong_object_1",
+      object: "event",
+      type: "checkout.session.completed",
+      data: {
+        object: {
+          id: "cs_test_wrong_object_1",
+          object: "payment_intent",
+          mode: "subscription",
+          payment_status: "paid",
+          metadata: { vendorId: vendor.id },
+        },
+      },
+    };
+    const { payload, signature } = signedWebhook(event);
+
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+
+    const tx = await getDb()
+      .collection("transactions")
+      .findOne({ stripeSessionId: "cs_test_wrong_object_1" });
+    expect(tx).toBeNull();
+
+    const status = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(vendor));
+    expect(status.body.plan).toBe("free");
+  });
+
+  it("keeps activating Premium from a verified invoice.paid event", async () => {
+    const periodEnd = 1_900_000_000;
+    const vendor = await createTestUser({ role: "vendor" });
+    await updateUser(vendor.id, { stripeCustomerId: "cus_invoice_1" });
+    mockSubscriptionRetrieve(periodEnd);
+
+    const event = {
+      id: "evt_invoice_paid_1",
+      object: "event",
+      type: "invoice.paid",
+      data: {
+        object: {
+          id: "in_test_1",
+          object: "invoice",
+          customer: "cus_invoice_1",
+          subscription: "sub_invoice_1",
+        },
+      },
+    };
+    const { payload, signature } = signedWebhook(event);
+
+    await request(app)
+      .post("/api/subscriptions/webhook")
+      .set("Content-Type", "application/json")
+      .set("stripe-signature", signature)
+      .send(payload)
+      .expect(200);
+
+    const status = await request(app)
+      .get("/api/subscriptions/status")
+      .set("Authorization", await authorizationFor(vendor));
+    expect(status.body.plan).toBe("premium");
+    expect(status.body.premiumActive).toBe(true);
+    expect(status.body.expiresAt).toBe(new Date(periodEnd * 1000).toISOString());
   });
 });

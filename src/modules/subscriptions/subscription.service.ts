@@ -9,6 +9,7 @@ import {
   subscriptionPeriodEnd,
 } from "../../integrations/stripe/stripe.client.js";
 import {
+  findUserById,
   findUserByStripeCustomerId,
   updateUser,
 } from "../../lib/user-repository.js";
@@ -34,6 +35,42 @@ function isStripeResourceMissingError(error: unknown): boolean {
     "code" in error &&
     error.code === "resource_missing"
   );
+}
+
+/**
+ * Webhook objects are untrusted until their signature is verified, and even
+ * then different Stripe events carry different shapes. Check the Stripe object
+ * discriminator before treating a payload as a session, invoice, or subscription.
+ */
+function asStripeObject<T>(value: unknown, object: string): T | null {
+  if (!value || typeof value !== "object") return null;
+
+  const candidate = value as { id?: unknown; object?: unknown };
+  if (typeof candidate.id !== "string" || candidate.object !== object) {
+    return null;
+  }
+
+  return value as T;
+}
+
+function checkoutSessionFrom(value: unknown): Stripe.Checkout.Session | null {
+  return asStripeObject<Stripe.Checkout.Session>(value, "checkout.session");
+}
+
+function invoiceFrom(value: unknown): Stripe.Invoice | null {
+  return asStripeObject<Stripe.Invoice>(value, "invoice");
+}
+
+function subscriptionFrom(value: unknown): Stripe.Subscription | null {
+  return asStripeObject<Stripe.Subscription>(value, "subscription");
+}
+
+function logIgnoredCheckout(sessionId: string, reason: string): void {
+  console.info("[stripe-webhook] ignored checkout session", { sessionId, reason });
+}
+
+function logIgnoredEvent(type: string): void {
+  console.info("[stripe-webhook] ignored event with an invalid object", { type });
 }
 
 async function getOrCreateStripeCustomer(
@@ -166,27 +203,75 @@ async function activatePremium(
   });
 }
 
-async function handleCheckoutCompleted(
-  session: Stripe.Checkout.Session,
-): Promise<void> {
+/**
+ * Both `checkout.session.completed` and
+ * `checkout.session.async_payment_succeeded` go through this handler. A session
+ * only counts as a successful payment when Stripe reports `paid`; an unpaid or
+ * pending session must never grant Premium.
+ */
+async function handlePaidCheckoutSession(value: unknown): Promise<void> {
+  const session = checkoutSessionFrom(value);
+  if (!session) {
+    logIgnoredEvent("checkout.session");
+    return;
+  }
+
   if (session.mode !== "subscription") return;
 
-  const vendorId =
+  if (session.payment_status !== "paid") {
+    logIgnoredCheckout(
+      session.id,
+      `payment_status=${session.payment_status ?? "missing"}`,
+    );
+    return;
+  }
+
+  const rawVendorId =
     session.metadata?.vendorId ?? session.client_reference_id ?? null;
-  if (!vendorId) return;
+  const vendorId = typeof rawVendorId === "string" ? rawVendorId.trim() : "";
+  if (!vendorId) {
+    logIgnoredCheckout(session.id, "missing vendor owner");
+    return;
+  }
+
+  const vendor = await findUserById(vendorId);
+  if (!vendor || vendor.role !== "vendor") {
+    logIgnoredCheckout(session.id, "vendor owner not found");
+    return;
+  }
 
   const existing = await TransactionModel.findOne({
     stripeSessionId: session.id,
   });
 
+  // A session must stay tied to the vendor it was created for.
+  if (existing && existing.vendorId.toString() !== vendor.id) {
+    logIgnoredCheckout(session.id, "vendor owner mismatch");
+    return;
+  }
+
+  const customerId = customerIdFrom(session.customer);
+  if (
+    customerId &&
+    vendor.stripeCustomerId &&
+    customerId !== vendor.stripeCustomerId
+  ) {
+    logIgnoredCheckout(session.id, "customer mismatch");
+    return;
+  }
+
   // Idempotency: a replay of the same event must not re-apply the upgrade.
+  // This check happens before any Stripe read or user update, so replayed and
+  // related events cannot extend the subscription again or duplicate a payment.
   if (existing?.status === "paid") return;
 
   const stripe = getStripe();
-  const subscriptionId =
+  const sessionSubscriptionId =
     typeof session.subscription === "string"
       ? session.subscription
       : (session.subscription?.id ?? null);
+  const subscriptionId =
+    sessionSubscriptionId ?? existing?.stripeSubscriptionId ?? null;
 
   let periodEnd: Date | null = null;
   if (subscriptionId) {
@@ -194,13 +279,11 @@ async function handleCheckoutCompleted(
     periodEnd = subscriptionPeriodEnd(subscription);
   }
 
-  const customerId = customerIdFrom(session.customer);
-
   await TransactionModel.findOneAndUpdate(
     { stripeSessionId: session.id },
     {
       $set: {
-        vendorId: new Types.ObjectId(vendorId),
+        vendorId: new Types.ObjectId(vendor.id),
         plan: "premium",
         amount: (session.amount_total ?? 0) / 100,
         currency: (session.currency ?? "usd").toUpperCase(),
@@ -212,7 +295,7 @@ async function handleCheckoutCompleted(
     { upsert: true, returnDocument: "after" },
   );
 
-  await activatePremium(vendorId, {
+  await activatePremium(vendor.id, {
     customerId,
     subscriptionId,
     periodEnd,
@@ -323,36 +406,46 @@ export async function handleStripeWebhook(
 
   switch (event.type) {
     case "checkout.session.completed":
-      await handleCheckoutCompleted(
-        event.data.object as Stripe.Checkout.Session,
-      );
+    case "checkout.session.async_payment_succeeded": {
+      await handlePaidCheckoutSession(event.data.object);
       break;
-    case "checkout.session.expired":
-      await handleCheckoutExpired(event.data.object as Stripe.Checkout.Session);
+    }
+    case "checkout.session.expired": {
+      const session = checkoutSessionFrom(event.data.object);
+      if (session) await handleCheckoutExpired(session);
+      else logIgnoredEvent(event.type);
       break;
-    case "checkout.session.async_payment_failed":
-      await handleCheckoutAsyncPaymentFailed(
-        event.data.object as Stripe.Checkout.Session,
-      );
+    }
+    case "checkout.session.async_payment_failed": {
+      const session = checkoutSessionFrom(event.data.object);
+      if (session) await handleCheckoutAsyncPaymentFailed(session);
+      else logIgnoredEvent(event.type);
       break;
-    case "invoice.paid":
-      await handleInvoicePaid(event.data.object as Stripe.Invoice);
+    }
+    case "invoice.paid": {
+      const invoice = invoiceFrom(event.data.object);
+      if (invoice) await handleInvoicePaid(invoice);
+      else logIgnoredEvent(event.type);
       break;
-    case "invoice.payment_failed":
-      await handleInvoiceFailed(event.data.object as Stripe.Invoice);
+    }
+    case "invoice.payment_failed": {
+      const invoice = invoiceFrom(event.data.object);
+      if (invoice) await handleInvoiceFailed(invoice);
+      else logIgnoredEvent(event.type);
       break;
-    case "customer.subscription.updated":
-      await handleSubscriptionChanged(
-        event.data.object as Stripe.Subscription,
-        false,
-      );
+    }
+    case "customer.subscription.updated": {
+      const subscription = subscriptionFrom(event.data.object);
+      if (subscription) await handleSubscriptionChanged(subscription, false);
+      else logIgnoredEvent(event.type);
       break;
-    case "customer.subscription.deleted":
-      await handleSubscriptionChanged(
-        event.data.object as Stripe.Subscription,
-        true,
-      );
+    }
+    case "customer.subscription.deleted": {
+      const subscription = subscriptionFrom(event.data.object);
+      if (subscription) await handleSubscriptionChanged(subscription, true);
+      else logIgnoredEvent(event.type);
       break;
+    }
     default:
       break;
   }

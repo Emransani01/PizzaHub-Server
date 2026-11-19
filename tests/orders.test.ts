@@ -252,4 +252,82 @@ describe("orders", () => {
       .set("Authorization", await authorizationFor(admin));
     expect(adminList.body.total).toBe(1);
   });
+
+  it("only lets customers order approved and available items", async () => {
+    const vendor = await createTestUser({ role: "vendor", businessName: "Napoli" });
+    const admin = await createTestUser({ role: "admin" });
+    const customer = await createTestUser({ role: "customer" });
+    const vendorAuth = await authorizationFor(vendor);
+    const adminAuth = await authorizationFor(admin);
+    const customerAuth = await authorizationFor(customer);
+
+    async function createNamedItem(itemName: string): Promise<string> {
+      const created = await request(app)
+        .post("/api/menu-items")
+        .set("Authorization", vendorAuth)
+        .send({
+          itemName,
+          category: "Classic Pizzas",
+          description: "A properly described pizza for status tests.",
+          price: 11.5,
+          location: "Naples, FL",
+          images: ["https://images.pizzahub.test/status.jpg"],
+        })
+        .expect(201);
+      return created.body.id as string;
+    }
+
+    const pendingId = await createNamedItem("Pending Pizza");
+    const rejectedId = await createNamedItem("Rejected Pizza");
+    const inactiveId = await createNamedItem("Inactive Pizza");
+    const firstClassInactiveId = await createNamedItem("Stored Inactive Pizza");
+    const activeId = await createNamedItem("Active Pizza");
+
+    await request(app)
+      .patch(`/api/menu-items/${rejectedId}/status`)
+      .set("Authorization", adminAuth)
+      .send({ status: "rejected", reason: "Not this time." })
+      .expect(200);
+
+    for (const id of [inactiveId, activeId]) {
+      await request(app)
+        .patch(`/api/menu-items/${id}/status`)
+        .set("Authorization", adminAuth)
+        .send({ status: "approved" })
+        .expect(200);
+    }
+
+    await request(app)
+      .patch(`/api/menu-items/${inactiveId}`)
+      .set("Authorization", vendorAuth)
+      .send({ isAvailable: false })
+      .expect(200);
+
+    await request(app)
+      .patch(`/api/menu-items/${firstClassInactiveId}/status`)
+      .set("Authorization", adminAuth)
+      .send({ status: "inactive" })
+      .expect(200);
+
+    for (const id of [
+      pendingId,
+      rejectedId,
+      inactiveId,
+      firstClassInactiveId,
+    ]) {
+      const blocked = await request(app)
+        .post("/api/orders")
+        .set("Authorization", customerAuth)
+        .send(orderPayload(id));
+      expect(blocked.status).toBe(409);
+      expect(blocked.body.message).toContain("not currently available");
+    }
+
+    const allowed = await request(app)
+      .post("/api/orders")
+      .set("Authorization", customerAuth)
+      .send(orderPayload(activeId));
+    expect(allowed.status).toBe(201);
+    expect(allowed.body.itemName).toBe("Active Pizza");
+  });
 });

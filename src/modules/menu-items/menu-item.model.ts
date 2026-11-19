@@ -1,5 +1,6 @@
 import mongoose, { Schema, model, type Model, type Types } from "mongoose";
 import { MENU_CATEGORIES } from "../../lib/categories.js";
+import { MENU_ITEM_STATUSES } from "../../lib/menu-status.js";
 import type { MenuCategory, MenuItemStatus } from "../../types/index.js";
 
 export interface MenuItemDocument {
@@ -40,7 +41,7 @@ const menuItemSchema = new Schema<MenuItemDocument>(
     },
     status: {
       type: String,
-      enum: ["pending", "approved", "rejected"],
+      enum: [...MENU_ITEM_STATUSES],
       default: "pending",
       required: true,
       index: true,

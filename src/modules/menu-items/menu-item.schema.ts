@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { MENU_CATEGORIES } from "../../lib/categories.js";
 import { categoryFromSlug } from "../../lib/categories.js";
+import { MENU_ITEM_STATUSES } from "../../lib/menu-status.js";
 import type { MenuCategory } from "../../types/index.js";
 
 const categorySchema = z
@@ -60,7 +61,7 @@ export const updateMenuItemSchema = z
   });
 
 export const adminStatusSchema = z.object({
-  status: z.enum(["pending", "approved", "rejected"]),
+  status: z.enum(MENU_ITEM_STATUSES),
   reason: z.string().trim().max(500).optional(),
 });
 
@@ -78,7 +79,7 @@ export const publicMenuQuerySchema = z.object({
 });
 
 export const adminMenuQuerySchema = publicMenuQuerySchema.extend({
-  status: z.enum(["pending", "approved", "rejected"]).optional(),
+  status: z.enum(MENU_ITEM_STATUSES).optional(),
   vendorId: z.string().trim().max(40).optional(),
 });
 

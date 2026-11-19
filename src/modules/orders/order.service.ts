@@ -1,5 +1,6 @@
 import { Types, type HydratedDocument } from "mongoose";
 import { ApiError } from "../../lib/api-error.js";
+import { isMenuItemPublic } from "../../lib/menu-status.js";
 import { toObjectId } from "../../lib/object-id.js";
 import { findUsersByIds } from "../../lib/user-repository.js";
 import type { AppUser, OrderStatus, UserRole } from "../../types/index.js";
@@ -141,7 +142,7 @@ export async function createOrder(
     throw ApiError.forbidden("You cannot order your own menu items.");
   }
 
-  if (item.status !== "approved" || !item.isAvailable) {
+  if (!isMenuItemPublic(item.status, item.isAvailable)) {
     throw ApiError.conflict(
       "This item is not currently available for ordering.",
     );
