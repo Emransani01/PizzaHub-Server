@@ -11,7 +11,7 @@ Vendor Premium subscription.
 
 ## Links
 
-- Live client website URL: **PENDING DEPLOYMENT — no verified live URL yet**
+- Live client website URL: <https://pizza-hub-client.vercel.app>
 - Live API deployment: <https://pizza-hub-server.vercel.app>
 - Client GitHub repository URL: <https://github.com/Emransani01/PizzaHub-Client>
 - Server GitHub repository URL: <https://github.com/Emransani01/PizzaHub-Server>
@@ -20,7 +20,7 @@ Vendor Premium subscription.
 
 | Layer | Choice |
 | --- | --- |
-| Runtime | Node.js 20+, ESM (`"type": "module"`) |
+| Runtime | Node.js 22.12.x, 24.x, or 26.x, ESM (`"type": "module"`) |
 | HTTP | Express 5 |
 | Language | TypeScript |
 | Database | MongoDB replica set/sharded cluster (Atlas in deployment, `MongoMemoryReplSet` in tests) |
@@ -34,7 +34,7 @@ Vendor Premium subscription.
 
 ## Requirements
 
-- Node.js 20 or newer
+- Node.js 22.12.x, 24.x, or 26.x
 - npm 10 or newer
 - A MongoDB replica set or sharded cluster for local development (Atlas M0+ works; a standalone `mongod` cannot provide the transactions required by cart checkout)
 - On Windows, the Microsoft Visual C++ Redistributable (x64) is required by the
@@ -348,6 +348,7 @@ Returns `{ role, stats, series, recentOrders }`.
 3. Add a webhook endpoint pointing at
    `<API_URL>/api/subscriptions/webhook` and subscribe at minimum to:
    - `checkout.session.completed` (activates Premium only after verification; idempotent)
+   - `checkout.session.async_payment_succeeded` (activates Premium after async payment succeeds; idempotent)
    - `checkout.session.expired` (marks pending checkout transaction `expired`, never grants Premium)
    - `checkout.session.async_payment_failed` (marks pending checkout transaction `failed`, never grants Premium)
    - `invoice.paid` (keeps subscription period/current state in sync)
