@@ -1,6 +1,7 @@
-import { Types, type HydratedDocument } from "mongoose";
+import { Types, type HydratedDocument, type UpdateQuery } from "mongoose";
 import { ApiError } from "../../lib/api-error.js";
 import { isMenuItemPublic } from "../../lib/menu-status.js";
+import { roundMoney } from "../../lib/money.js";
 import { toObjectId } from "../../lib/object-id.js";
 import { findUsersByIds } from "../../lib/user-repository.js";
 import type { AppUser, OrderStatus, UserRole } from "../../types/index.js";
@@ -23,6 +24,9 @@ export interface OrderView {
   itemName: string;
   itemImage: string | null;
   itemPrice: number;
+  quantity: number;
+  lineTotal: number;
+  checkoutGroupId: string | null;
   vendorId: string;
   vendorName: string;
   customerId: string;
@@ -42,7 +46,7 @@ export interface OrderView {
   updatedAt: string | null;
 }
 
-function normalizeDeliveryDate(value: string): Date {
+export function normalizeDeliveryDate(value: string): Date {
   const date = new Date(`${value}T00:00:00.000Z`);
   if (Number.isNaN(date.getTime())) {
     throw ApiError.unprocessable("Delivery date is not a valid date.");
@@ -58,14 +62,14 @@ function normalizeDeliveryDate(value: string): Date {
   return date;
 }
 
-function startOfTodayUtc(): Date {
+export function startOfTodayUtc(): Date {
   const now = new Date();
   return new Date(
     Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()),
   );
 }
 
-function activeOrderKey(
+export function activeOrderKey(
   customerId: string,
   itemId: string,
   deliveryDate: Date,
@@ -79,7 +83,9 @@ function isDuplicateActiveOrderError(error: unknown): boolean {
   return e.code === 11000 && Boolean(e.keyPattern?.activeOrderKey);
 }
 
-async function serialize(docs: OrderHydrated[]): Promise<OrderView[]> {
+export async function serializeOrders(
+  docs: OrderHydrated[],
+): Promise<OrderView[]> {
   const userIds = new Set<string>();
   for (const doc of docs) {
     userIds.add(doc.vendorId.toString());
@@ -98,6 +104,9 @@ async function serialize(docs: OrderHydrated[]): Promise<OrderView[]> {
       itemName: doc.itemName,
       itemImage: doc.itemImage ?? null,
       itemPrice: doc.itemPrice,
+      quantity: doc.quantity,
+      lineTotal: roundMoney(doc.itemPrice * doc.quantity),
+      checkoutGroupId: doc.checkoutGroupId ?? null,
       vendorId: doc.vendorId.toString(),
       vendorName: vendor?.businessName ?? vendor?.name ?? "PizzaHub vendor",
       customerId: doc.customerId.toString(),
@@ -199,7 +208,7 @@ export async function createOrder(
     throw error;
   }
 
-  const [view] = await serialize([created]);
+  const [view] = await serializeOrders([created]);
   return view;
 }
 
@@ -227,7 +236,7 @@ export async function listOrders(user: AppUser, query: OrderQuery) {
   ]);
 
   return {
-    items: await serialize(docs),
+    items: await serializeOrders(docs),
     total,
     page: query.page,
     limit: query.limit,
@@ -257,7 +266,7 @@ export async function getOrderById(
     throw ApiError.forbidden("You do not have access to this order.");
   }
 
-  const [view] = await serialize([doc]);
+  const [view] = await serializeOrders([doc]);
   return view;
 }
 
@@ -315,13 +324,35 @@ export async function updateOrderStatus(
     note: note ?? null,
   };
 
-  doc.status = status;
-  if (status === "rejected" || status === "cancelled") {
-    doc.activeOrderKey = null;
-  }
-  doc.statusHistory = [...(doc.statusHistory ?? []), entry];
-  await doc.save();
+  const clearActiveOrderKey = status === "rejected" || status === "cancelled";
+  const update: UpdateQuery<OrderDocument> = {
+    $set: {
+      status,
+      ...(clearActiveOrderKey ? { activeOrderKey: null } : {}),
+    },
+    $push: { statusHistory: entry },
+  };
 
-  const [view] = await serialize([doc]);
+  // The status condition is the compare-and-swap: only one concurrent request
+  // can still see this order as pending. $push appends to the stored array so a
+  // losing request can never overwrite the winner's history entry.
+  const updated = await OrderModel.findOneAndUpdate(
+    { _id: objectId, status: "pending" },
+    update,
+    { returnDocument: "after", runValidators: true },
+  );
+
+  if (!updated) {
+    const latest = await OrderModel.findById(objectId).select("_id status").lean();
+    if (!latest) {
+      throw ApiError.notFound("Order not found.");
+    }
+    throw ApiError.conflict(
+      `Only pending orders can change status. This order is already ${latest.status}. ` +
+        "It may have been changed by another request.",
+    );
+  }
+
+  const [view] = await serializeOrders([updated]);
   return view;
 }

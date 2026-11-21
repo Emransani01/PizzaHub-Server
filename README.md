@@ -23,7 +23,7 @@ Vendor Premium subscription.
 | Runtime | Node.js 20+, ESM (`"type": "module"`) |
 | HTTP | Express 5 |
 | Language | TypeScript |
-| Database | MongoDB (Atlas in deployment, `mongodb-memory-server` in tests) |
+| Database | MongoDB replica set/sharded cluster (Atlas in deployment, `MongoMemoryReplSet` in tests) |
 | ODM | Mongoose (business data) + Better Auth MongoDB adapter (auth data) |
 | Auth | Better Auth (email/password + optional Google OAuth) |
 | Tokens | HS256 JWT via `jose`, 15 minutes, stored only in client memory |
@@ -36,7 +36,7 @@ Vendor Premium subscription.
 
 - Node.js 20 or newer
 - npm 10 or newer
-- A MongoDB Atlas cluster (or any MongoDB 6+ instance) for local development
+- A MongoDB replica set or sharded cluster for local development (Atlas M0+ works; a standalone `mongod` cannot provide the transactions required by cart checkout)
 - On Windows, the Microsoft Visual C++ Redistributable (x64) is required by the
   MongoDB binary that `mongodb-memory-server` downloads for the test suite.
   Install it from <https://aka.ms/vs/17/release/vc_redist.x64.exe> if
@@ -250,9 +250,49 @@ filtering against MongoDB:
 | `GET` | `/orders?status=&page=&limit=` | customers see their own orders, vendors see orders for their items, admins see all |
 | `GET` | `/orders/:id` | order owner, the item's vendor, or admin |
 | `PATCH` | `/orders/:id/status` | vendor: `accepted`/`rejected`; customer: `cancelled` while `pending` |
+| `POST` | `/orders/quote` | customer (`items: [{ itemId, quantity, expectedUnitPrice? }]`) |
+| `POST` | `/orders/checkout` | customer (stable `checkoutGroupId`, `items`, `quoteToken`, delivery fields) |
 
 Every transition appends `{ status, changedBy, changedByRole, changedAt, note }`
-to `statusHistory`, which powers the customer status timeline.
+to `statusHistory`, which powers the customer status timeline. `POST /orders`
+remains the backward-compatible single-item endpoint and always creates one
+`pending` order with `quantity: 1` and `checkoutGroupId: null`.
+
+#### Cart quote and checkout
+
+The client persists the cart locally; the API never trusts client-side prices.
+
+1. `POST /orders/quote` loads current menu prices and returns `lines`,
+   `canCheckout`, `issues`, authoritative `subtotal`/`total`, `quoteToken` and
+   `quoteExpiresAt`. `issues` uses the
+   codes `MISSING`, `UNAVAILABLE`, `OWN_ITEM` and `PRICE_CHANGED`. When any
+   issue exists, `canCheckout` is `false` and no token is issued. The optional
+   `expectedUnitPrice` is only the price displayed in the browser; it exists so
+   a price change must be explicitly reviewed and re-quoted. To clear a
+   `PRICE_CHANGED` issue, the client re-quotes with `acknowledgedUnitPrice` set
+   to the authoritative `currentUnitPrice`. The server accepts only an exact
+   match, signs that acknowledgement into the token, and re-checks database
+   prices at checkout.
+2. A successful quote returns an HS256 token signed with `JWT_SECRET`, scoped to
+   the customer and the exact item ids/quantities/prices, valid for **10
+   minutes**. Checkout verifies this token and ignores any client-supplied
+   price. Tampered, expired or mismatched carts receive `409` with a
+   `QUOTE_INVALID`/`QUOTE_EXPIRED` code and `details.requiresFreshQuote: true`.
+3. `POST /orders/checkout` writes one `checkout_groups` document and one order
+   per cart line inside a single MongoDB transaction. The group stores the
+   canonical request hash, order ids, quantities and money snapshot. Order
+   documents add `quantity`, `lineTotal` and `checkoutGroupId` while preserving
+   the existing `activeOrderKey = customer:item:date` partial unique index.
+   There is no delivery fee or tax, so `total === subtotal`.
+4. Retrying the same `checkoutGroupId` and identical request returns `200` with
+   `replayed: true` and the original orders. Reusing the id with different
+   request data returns `409 CHECKOUT_GROUP_CONFLICT`. Overlapping active items
+   from different groups return `409 ACTIVE_ORDER_EXISTS`.
+5. Any write failure aborts the whole transaction: no partial order lines and
+   no orphan group are left behind. Startup verifies replica-set/transaction
+   support and fails fast instead of falling back to a non-atomic path.
+
+Customer checkout never uses Stripe and never touches Premium subscriptions.
 
 ### Favourites
 
@@ -368,10 +408,11 @@ controls and explains why when the integration is not configured.
 npm test
 ```
 
-The suite boots `mongodb-memory-server`, so no Atlas connection is required and
-no real data is touched. It covers menu limits and approval, order state
-transitions and ownership, role/authorization rules, and subscription checkout
-and webhook handling.
+The suite boots a single-node `MongoMemoryReplSet` with WiredTiger, so it can
+exercise the checkout transaction without an Atlas connection or real data. It
+covers menu limits and approval, order state transitions and ownership,
+role/authorization rules, quote freshness, checkout atomicity, idempotent
+replay, group conflicts and subscription checkout/webhook handling.
 
 ## Project layout
 
@@ -380,7 +421,7 @@ server/
   src/
     config/          environment parsing
     integrations/    Stripe and ImgBB clients
-    lib/             auth, jwt, async handler, categories, repositories
+    lib/             auth, jwt, quote tokens, transactions, money helpers
     middleware/      authenticate, authorize-role, blocked-user, validation, uploads
     modules/         auth, users, menu-items, orders, favorites,
                      subscriptions, transactions, dashboard, uploads, config

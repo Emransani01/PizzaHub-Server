@@ -7,13 +7,18 @@ import {
   validatedParams,
   validatedQuery,
 } from "../../middleware/validate-request.js";
+import { checkoutCart, quoteCart } from "./checkout.service.js";
 import {
+  checkoutCartSchema,
   createOrderSchema,
   orderIdSchema,
   orderQuerySchema,
   orderStatusSchema,
+  quoteCartSchema,
+  type CheckoutCartInput,
   type CreateOrderInput,
   type OrderQuery,
+  type QuoteCartInput,
 } from "./order.schema.js";
 import {
   createOrder,
@@ -42,6 +47,21 @@ export const createOrderHandler: RequestHandler = asyncHandler(
     const input = validatedBody<CreateOrderInput>(req);
     const order = await createOrder(req.user, input);
     res.status(201).json(order);
+  },
+);
+
+export const quoteCartHandler: RequestHandler = asyncHandler(async (req, res) => {
+  if (!req.user) throw ApiError.unauthorized();
+  const input = validatedBody<QuoteCartInput>(req);
+  res.status(200).json(await quoteCart(req.user, input));
+});
+
+export const checkoutCartHandler: RequestHandler = asyncHandler(
+  async (req, res) => {
+    if (!req.user) throw ApiError.unauthorized();
+    const input = validatedBody<CheckoutCartInput>(req);
+    const result = await checkoutCart(req.user, input);
+    res.status(result.replayed ? 200 : 201).json(result);
   },
 );
 

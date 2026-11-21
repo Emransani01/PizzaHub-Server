@@ -4,7 +4,8 @@ import type { TransactionStatus } from "../../types/index.js";
 /**
  * Vendor Premium subscription payments only. Customer pizza orders are not
  * paid through Stripe, so this collection never stores order payments.
- * Records are written exclusively by the verified Stripe webhook.
+ * Checkout creation writes the initial pending record; only a verified Stripe
+ * webhook may advance it to a paid/failed/expired/cancelled state.
  */
 export interface TransactionDocument {
   vendorId: Types.ObjectId;

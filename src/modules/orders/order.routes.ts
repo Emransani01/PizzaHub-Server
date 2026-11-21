@@ -4,15 +4,19 @@ import { checkBlockedUser } from "../../middleware/check-blocked-user.js";
 import { authorizeRole } from "../../middleware/authorize-role.js";
 import { validateRequest } from "../../middleware/validate-request.js";
 import {
+  checkoutCartSchema,
   createOrderSchema,
   orderIdSchema,
   orderQuerySchema,
   orderStatusSchema,
+  quoteCartSchema,
 } from "./order.schema.js";
 import {
+  checkoutCartHandler,
   createOrderHandler,
   getOrderHandler,
   listOrdersHandler,
+  quoteCartHandler,
   updateOrderStatusHandler,
 } from "./order.controller.js";
 
@@ -24,6 +28,20 @@ router.get(
   "/",
   validateRequest({ query: orderQuerySchema }),
   listOrdersHandler,
+);
+
+router.post(
+  "/quote",
+  authorizeRole("customer"),
+  validateRequest({ body: quoteCartSchema }),
+  quoteCartHandler,
+);
+
+router.post(
+  "/checkout",
+  authorizeRole("customer"),
+  validateRequest({ body: checkoutCartSchema }),
+  checkoutCartHandler,
 );
 
 router.get(

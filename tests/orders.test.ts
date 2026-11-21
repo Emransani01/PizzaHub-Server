@@ -1,5 +1,5 @@
 import request from "supertest";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
 import { OrderModel } from "../src/modules/orders/order.model.js";
 import {
@@ -329,5 +329,164 @@ describe("orders", () => {
       .send(orderPayload(activeId));
     expect(allowed.status).toBe(201);
     expect(allowed.body.itemName).toBe("Active Pizza");
+  });
+
+  it("returns 404 for an unknown order id", async () => {
+    const { vendor } = await seedApprovedItem();
+
+    const response = await request(app)
+      .patch("/api/orders/64b7f1f1f1f1f1f1f1f1f1f1")
+      .set("Authorization", await authorizationFor(vendor))
+      .send({ status: "accepted" });
+
+    expect(response.status).toBe(404);
+  });
+
+  it("allows only one of two concurrent customer-cancel and vendor-accept requests", async () => {
+    const { itemId, vendor } = await seedApprovedItem();
+    const customer = await createTestUser({ role: "customer" });
+    const order = await request(app)
+      .post("/api/orders")
+      .set("Authorization", await authorizationFor(customer))
+      .send(orderPayload(itemId))
+      .expect(201);
+
+    const [cancelled, accepted] = await Promise.all([
+      request(app)
+        .patch(`/api/orders/${order.body.id}/status`)
+        .set("Authorization", await authorizationFor(customer))
+        .send({ status: "cancelled" }),
+      request(app)
+        .patch(`/api/orders/${order.body.id}/status`)
+        .set("Authorization", await authorizationFor(vendor))
+        .send({ status: "accepted", note: "In the oven" }),
+    ]);
+
+    expect([cancelled.status, accepted.status].sort()).toEqual([200, 409]);
+
+    const stored = await OrderModel.findById(order.body.id);
+    expect(stored).not.toBeNull();
+    expect(stored?.status).toMatch(/^(accepted|cancelled)$/);
+    expect(stored?.statusHistory).toHaveLength(2);
+    expect(stored?.statusHistory.filter((entry) => entry.status !== "pending")).toHaveLength(1);
+
+    const loser = cancelled.status === 409 ? cancelled : accepted;
+    expect(loser.body.message).toContain("already");
+    expect(loser.body.message).toContain("another request");
+  });
+
+  it("does not accept two concurrent identical vendor decisions", async () => {
+    const { itemId, vendor } = await seedApprovedItem();
+    const customer = await createTestUser({ role: "customer" });
+    const order = await request(app)
+      .post("/api/orders")
+      .set("Authorization", await authorizationFor(customer))
+      .send(orderPayload(itemId))
+      .expect(201);
+
+    const vendorAuth = await authorizationFor(vendor);
+    const [first, second] = await Promise.all([
+      request(app)
+        .patch(`/api/orders/${order.body.id}/status`)
+        .set("Authorization", vendorAuth)
+        .send({ status: "accepted" }),
+      request(app)
+        .patch(`/api/orders/${order.body.id}/status`)
+        .set("Authorization", vendorAuth)
+        .send({ status: "accepted" }),
+    ]);
+
+    expect([first.status, second.status].sort()).toEqual([200, 409]);
+    const stored = await OrderModel.findById(order.body.id);
+    expect(stored?.status).toBe("accepted");
+    expect(stored?.statusHistory).toHaveLength(2);
+    expect(stored?.statusHistory.filter((entry) => entry.status === "accepted")).toHaveLength(1);
+  });
+
+  it("keeps activeOrderKey on acceptance and releases it on rejection or cancellation", async () => {
+    const { itemId, vendor } = await seedApprovedItem();
+    const vendorAuth = await authorizationFor(vendor);
+    const customer = await createTestUser({ role: "customer" });
+    const customerAuth = await authorizationFor(customer);
+
+    let sequence = 0;
+    async function placeOrder() {
+      const payload = orderPayload(itemId, {
+        deliveryDate: futureDate(3 + sequence),
+      });
+      sequence += 1;
+      const response = await request(app)
+        .post("/api/orders")
+        .set("Authorization", customerAuth)
+        .send(payload)
+        .expect(201);
+      return { id: response.body.id as string, payload };
+    }
+
+    const accepted = await placeOrder();
+    await request(app)
+      .patch(`/api/orders/${accepted.id}/status`)
+      .set("Authorization", vendorAuth)
+      .send({ status: "accepted" })
+      .expect(200);
+    expect((await OrderModel.findById(accepted.id))?.activeOrderKey).toBeTruthy();
+    await request(app)
+      .post("/api/orders")
+      .set("Authorization", customerAuth)
+      .send(accepted.payload)
+      .expect(409);
+
+    for (const status of ["rejected", "cancelled"] as const) {
+      const current = await placeOrder();
+      const auth = status === "rejected" ? vendorAuth : customerAuth;
+      await request(app)
+        .patch(`/api/orders/${current.id}/status`)
+        .set("Authorization", auth)
+        .send({ status })
+        .expect(200);
+      expect((await OrderModel.findById(current.id))?.activeOrderKey).toBeNull();
+      await request(app)
+        .post("/api/orders")
+        .set("Authorization", customerAuth)
+        .send(current.payload)
+        .expect(201);
+    }
+  });
+
+  it("distinguishes a deleted order from a concurrent state change on a lost conditional update", async () => {
+    const { itemId, vendor } = await seedApprovedItem();
+    const customer = await createTestUser({ role: "customer" });
+    const order = await request(app)
+      .post("/api/orders")
+      .set("Authorization", await authorizationFor(customer))
+      .send(orderPayload(itemId))
+      .expect(201);
+
+    const realFindById = OrderModel.findById.bind(OrderModel);
+    let findByIdCalls = 0;
+    const findByIdSpy = vi.spyOn(OrderModel, "findById").mockImplementation(
+      ((id: Parameters<typeof OrderModel.findById>[0]) => {
+        findByIdCalls += 1;
+        if (findByIdCalls === 2) {
+          return { select: () => ({ lean: async () => null }) } as never;
+        }
+        return realFindById(id);
+      }) as never,
+    );
+    const updateSpy = vi
+      .spyOn(OrderModel, "findOneAndUpdate")
+      .mockResolvedValueOnce(null as never);
+
+    try {
+      const response = await request(app)
+        .patch(`/api/orders/${order.body.id}/status`)
+        .set("Authorization", await authorizationFor(vendor))
+        .send({ status: "accepted" });
+      expect(response.status).toBe(404);
+      expect(findByIdCalls).toBe(2);
+    } finally {
+      findByIdSpy.mockRestore();
+      updateSpy.mockRestore();
+    }
   });
 });

@@ -15,7 +15,10 @@ export interface OrderDocument {
   customerId: Types.ObjectId;
   itemName: string;
   itemImage: string | null;
+  /** Unit price captured from the database when the order was created. */
   itemPrice: number;
+  quantity: number;
+  checkoutGroupId: string | null;
   deliveryDate: Date;
   deliveryAddress: string;
   message: string | null;
@@ -58,6 +61,8 @@ const orderSchema = new Schema<OrderDocument>(
     itemName: { type: String, required: true, trim: true },
     itemImage: { type: String, default: null },
     itemPrice: { type: Number, required: true, min: 0 },
+    quantity: { type: Number, required: true, min: 1, default: 1 },
+    checkoutGroupId: { type: String, default: null },
     deliveryDate: { type: Date, required: true, index: true },
     deliveryAddress: { type: String, required: true, trim: true, maxlength: 400 },
     message: { type: String, default: null, trim: true, maxlength: 600 },
@@ -95,6 +100,8 @@ orderSchema.index(
 );
 orderSchema.index({ vendorId: 1, status: 1, createdAt: -1 });
 orderSchema.index({ customerId: 1, status: 1, createdAt: -1 });
+// Checkout lines are read back by their stable group id during replay.
+orderSchema.index({ customerId: 1, checkoutGroupId: 1, createdAt: 1 });
 
 export const OrderModel: Model<OrderDocument> =
   (mongoose.models.Order as Model<OrderDocument> | undefined) ??

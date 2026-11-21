@@ -1,4 +1,8 @@
-import { Types, type HydratedDocument } from "mongoose";
+import {
+  Types,
+  type HydratedDocument,
+  type UpdateQuery,
+} from "mongoose";
 import { env } from "../../config/environment.js";
 import { ApiError } from "../../lib/api-error.js";
 import { MENU_CATEGORIES } from "../../lib/categories.js";
@@ -322,23 +326,200 @@ async function countActiveItems(
   return MenuItemModel.countDocuments(filter);
 }
 
+function freePlanLimitMessage(): string {
+  return (
+    `Free vendor accounts can have at most ${env.freePlanActiveItemLimit} active menu items. ` +
+    "Upgrade to Premium for unlimited items, or make an existing item unavailable."
+  );
+}
+
+function concurrentUpdateMessage(): string {
+  return "This menu item was changed by another request. Refresh and try again.";
+}
+
 /**
  * Assignment rule: a free vendor may hold at most three admin-approved, active
  * items. Pending and rejected items do not count toward the limit.
  */
+async function assertFreeCapacity(
+  vendor: AppUser,
+  premium: boolean,
+  excludeItemId?: Types.ObjectId,
+): Promise<void> {
+  if (premium) return;
+
+  const active = await countActiveItems(vendor.id, excludeItemId);
+  if (active >= env.freePlanActiveItemLimit) {
+    throw ApiError.conflict(freePlanLimitMessage());
+  }
+}
+
+/** Kept as the public form of the capacity check for existing callers. */
 export async function assertActiveItemCapacity(
   vendor: AppUser,
   excludeItemId?: Types.ObjectId,
 ): Promise<void> {
-  if (isPremiumActive(vendor)) return;
+  await assertFreeCapacity(vendor, isPremiumActive(vendor), excludeItemId);
+}
 
-  const active = await countActiveItems(vendor.id, excludeItemId);
-  if (active >= env.freePlanActiveItemLimit) {
-    throw ApiError.conflict(
-      `Free vendor accounts can have at most ${env.freePlanActiveItemLimit} active menu items. ` +
-        "Upgrade to Premium for unlimited items, or make an existing item unavailable.",
+/**
+ * A duplicate-key error is the only database error we recover from, and only
+ * when it comes from the active-slot index. Everything else propagates so a
+ * failed activation can never be mistaken for a successful one.
+ */
+function isActiveSlotCollision(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const e = error as {
+    code?: number;
+    keyPattern?: Record<string, unknown>;
+    message?: string;
+  };
+  return (
+    e.code === 11000 &&
+    ((e.keyPattern !== undefined && "activeSlot" in e.keyPattern) ||
+      /uniq_vendor_active_slot/.test(e.message ?? ""))
+  );
+}
+
+function writeMenuItem(
+  filter: Record<string, unknown>,
+  update: UpdateQuery<MenuItemDocument>,
+): Promise<MenuItemHydrated | null> {
+  return MenuItemModel.findOneAndUpdate(filter, update, {
+    returnDocument: "after",
+    runValidators: true,
+  });
+}
+
+function requireUpdated(doc: MenuItemHydrated | null): MenuItemHydrated {
+  if (!doc) throw ApiError.conflict(concurrentUpdateMessage());
+  return doc;
+}
+
+/**
+ * Backfill only touches documents that are ALREADY approved and available.
+ * It never changes status or availability; it only gives a legacy active item
+ * a slot. This is the repair half of the lazy reconciliation.
+ */
+async function backfillSlots(vendorId: Types.ObjectId): Promise<void> {
+  const unslotted = await MenuItemModel.find({
+    vendorId,
+    status: "approved",
+    isAvailable: true,
+    activeSlot: null,
+  })
+    .select("_id")
+    .sort({ createdAt: 1, _id: 1 })
+    .lean();
+
+  for (const candidate of unslotted) {
+    for (let slot = 0; slot < env.freePlanActiveItemLimit; slot += 1) {
+      try {
+        const claimed = await MenuItemModel.findOneAndUpdate(
+          {
+            _id: candidate._id,
+            vendorId,
+            status: "approved",
+            isAvailable: true,
+            activeSlot: null,
+          },
+          { $set: { activeSlot: slot } },
+        );
+        if (claimed) break;
+      } catch (error) {
+        if (!isActiveSlotCollision(error)) throw error;
+      }
+    }
+  }
+}
+
+/** Clears slots held by documents that are no longer active. */
+async function clearStaleSlots(vendorId: Types.ObjectId): Promise<void> {
+  await MenuItemModel.updateMany(
+    {
+      vendorId,
+      activeSlot: { $ne: null },
+      $or: [{ status: { $ne: "approved" } }, { isAvailable: false }],
+    },
+    { $set: { activeSlot: null } },
+  );
+}
+
+async function syncActiveSlots(vendorId: Types.ObjectId): Promise<void> {
+  await clearStaleSlots(vendorId);
+  await backfillSlots(vendorId);
+}
+
+interface DesiredMenuItemState {
+  status: MenuItemStatus;
+  isAvailable: boolean;
+  rejectionReason: string | null;
+  content: Record<string, unknown>;
+}
+
+/**
+ * Every state change is one conditional single-document write.
+ *
+ * - Deactivation writes activeSlot: null in the same write that removes the
+ *   item from the active set.
+ * - An item that was already active keeps its slot (idempotent approval).
+ * - Claiming a slot from pending/inactive sets the desired approved+available
+ *   state AND the slot in the same atomic write, so no observer can see a
+ *   partially activated item.
+ */
+async function persistMenuItemState(
+  doc: MenuItemHydrated,
+  vendor: AppUser | null,
+  desired: DesiredMenuItemState,
+): Promise<MenuItemHydrated> {
+  // Entitlement is evaluated exactly once per request, from the freshly
+  // loaded vendor, before any slot work. Expiry during the write does not
+  // retroactively deactivate an item or change the outcome of this request.
+  const premium = vendor !== null && isPremiumActive(vendor);
+  const wasActive = doc.status === "approved" && doc.isAvailable;
+  const willBeActive = desired.status === "approved" && desired.isAvailable;
+  const filter = {
+    _id: doc._id,
+    status: doc.status,
+    isAvailable: doc.isAvailable,
+  };
+  const set = {
+    ...desired.content,
+    status: desired.status,
+    isAvailable: desired.isAvailable,
+    rejectionReason: desired.rejectionReason,
+  };
+
+  if (!willBeActive) {
+    return requireUpdated(
+      await writeMenuItem(filter, { $set: { ...set, activeSlot: null } }),
     );
   }
+
+  if (wasActive || !vendor || premium) {
+    return requireUpdated(await writeMenuItem(filter, { $set: set }));
+  }
+
+  // Fast path for the usual "already at capacity" case; the slot claim below
+  // is the authoritative concurrency guard.
+  await assertFreeCapacity(vendor, premium, doc._id);
+  await syncActiveSlots(doc.vendorId);
+
+  for (let slot = 0; slot < env.freePlanActiveItemLimit; slot += 1) {
+    try {
+      const updated = await writeMenuItem(
+        { ...filter, activeSlot: null },
+        { $set: { ...set, activeSlot: slot } },
+      );
+      if (updated) return updated;
+      throw ApiError.conflict(concurrentUpdateMessage());
+    } catch (error) {
+      if (isActiveSlotCollision(error)) continue;
+      throw error;
+    }
+  }
+
+  throw ApiError.conflict(freePlanLimitMessage());
 }
 
 export async function createMenuItem(
@@ -359,6 +540,17 @@ export async function createMenuItem(
   });
 
   return serializeOne(created);
+}
+
+function buildContentPatch(input: UpdateMenuItemInput): Record<string, unknown> {
+  const patch: Record<string, unknown> = {};
+  if (input.itemName !== undefined) patch.itemName = input.itemName;
+  if (input.category !== undefined) patch.category = input.category;
+  if (input.description !== undefined) patch.description = input.description;
+  if (input.price !== undefined) patch.price = input.price;
+  if (input.location !== undefined) patch.location = input.location;
+  if (input.images !== undefined) patch.images = input.images;
+  return patch;
 }
 
 export async function updateMenuItem(
@@ -387,46 +579,47 @@ export async function updateMenuItem(
     ["itemName", "category", "description", "price", "location", "images"] as const
   ).some((key) => input[key] !== undefined);
 
+  // Compute the complete final state first. Capacity is only consulted when
+  // that final state is active, so a content edit that returns an item to
+  // pending does not consume (or check) active capacity.
+  let desiredStatus: MenuItemStatus = doc.status;
   if (
-    input.isAvailable === true &&
-    !doc.isAvailable &&
+    input.isAvailable !== undefined &&
     (doc.status === "approved" || doc.status === "inactive")
   ) {
-    const vendor = await findUserById(doc.vendorId.toString());
-    if (vendor) {
-      await assertActiveItemCapacity(vendor, objectId);
-    }
+    desiredStatus = input.isAvailable ? "approved" : "inactive";
   }
 
-  if (contentChanged) {
-    doc.itemName = input.itemName ?? doc.itemName;
-    doc.category = (input.category as typeof doc.category) ?? doc.category;
-    doc.description = input.description ?? doc.description;
-    doc.price = input.price ?? doc.price;
-    doc.location = input.location ?? doc.location;
-    doc.images = input.images ?? doc.images;
-  }
-
-  if (input.isAvailable !== undefined) {
-    doc.isAvailable = input.isAvailable;
-    if (doc.status === "approved" || doc.status === "inactive") {
-      doc.status = input.isAvailable ? "approved" : "inactive";
-    }
-  }
-
-  // A vendor editing approved or paused content must be reviewed again so
-  // approval can never be used to smuggle in different content after the fact.
+  let rejectionReason: string | null = doc.rejectionReason ?? null;
   if (
     contentChanged &&
     isOwner &&
-    (doc.status === "approved" || doc.status === "inactive")
+    (desiredStatus === "approved" || desiredStatus === "inactive")
   ) {
-    doc.status = "pending";
-    doc.rejectionReason = null;
+    // A vendor editing approved or paused content must be reviewed again so
+    // approval can never be used to smuggle in different content afterwards.
+    desiredStatus = "pending";
+    rejectionReason = null;
   }
 
-  await doc.save();
-  return serializeOne(doc);
+  const desiredAvailable =
+    input.isAvailable !== undefined ? input.isAvailable : doc.isAvailable;
+
+  const needsCapacityDecision =
+    desiredStatus === "approved" &&
+    desiredAvailable &&
+    !(doc.status === "approved" && doc.isAvailable);
+  const vendor = needsCapacityDecision
+    ? await findUserById(doc.vendorId.toString())
+    : null;
+
+  const updated = await persistMenuItemState(doc, vendor, {
+    status: desiredStatus,
+    isAvailable: desiredAvailable,
+    rejectionReason,
+    content: buildContentPatch(input),
+  });
+  return serializeOne(updated);
 }
 
 export async function setMenuItemStatus(
@@ -444,33 +637,35 @@ export async function setMenuItemStatus(
     throw ApiError.notFound("Menu item not found.");
   }
 
+  // Admin approval publishes paused and rejected items again. A pending item
+  // that the vendor deliberately created unavailable keeps that choice, so it
+  // still does not consume the free-plan active-item allowance.
+  const shouldReactivate =
+    isPausedMenuItem(doc.status, doc.isAvailable) || doc.status === "rejected";
+
+  let desiredAvailable = doc.isAvailable;
+  let vendor: AppUser | null = null;
+
   if (status === "approved") {
-    const vendor = await findUserById(doc.vendorId.toString());
+    vendor = await findUserById(doc.vendorId.toString());
     if (!vendor) {
       throw ApiError.unprocessable(
         "The vendor account for this item no longer exists.",
       );
     }
-    // Admin approval publishes paused and rejected items again. A pending item
-    // that the vendor deliberately created unavailable keeps that choice, so it
-    // still does not consume the free-plan active-item allowance.
-    const shouldReactivate =
-      isPausedMenuItem(doc.status, doc.isAvailable) || doc.status === "rejected";
-    const willBeAvailable = doc.isAvailable || shouldReactivate;
-
-    if (willBeAvailable) {
-      await assertActiveItemCapacity(vendor, objectId);
-    }
-    if (shouldReactivate) doc.isAvailable = true;
+    if (shouldReactivate) desiredAvailable = true;
   }
 
-  if (status === "inactive") doc.isAvailable = false;
+  if (status === "inactive") desiredAvailable = false;
 
-  doc.status = status;
-  doc.rejectionReason = status === "rejected" ? (reason ?? null) : null;
-  await doc.save();
+  const updated = await persistMenuItemState(doc, vendor, {
+    status,
+    isAvailable: desiredAvailable,
+    rejectionReason: status === "rejected" ? (reason ?? null) : null,
+    content: {},
+  });
 
-  return serializeOne(doc);
+  return serializeOne(updated);
 }
 
 export async function deleteMenuItem(

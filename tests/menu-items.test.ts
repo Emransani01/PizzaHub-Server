@@ -1,8 +1,12 @@
 import { Types } from "mongoose";
 import request from "supertest";
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createApp } from "../src/app.js";
-import { MenuItemModel } from "../src/modules/menu-items/menu-item.model.js";
+import { updateUser } from "../src/lib/user-repository.js";
+import {
+  ensureMenuItemIndexes,
+  MenuItemModel,
+} from "../src/modules/menu-items/menu-item.model.js";
 import {
   authorizationFor,
   clearDatabase,
@@ -31,6 +35,31 @@ async function createItem(
     .post("/api/menu-items")
     .set("Authorization", token)
     .send(itemPayload(overrides));
+}
+
+async function createPendingItem(
+  token: string,
+  itemName: string,
+  isAvailable = true,
+): Promise<string> {
+  const created = await createItem(token, { itemName, isAvailable });
+  expect(created.status).toBe(201);
+  return created.body.id as string;
+}
+
+function approveItem(adminAuth: string, itemId: string) {
+  return request(app)
+    .patch(`/api/menu-items/${itemId}/status`)
+    .set("Authorization", adminAuth)
+    .send({ status: "approved" });
+}
+
+async function countActive(vendorId: string): Promise<number> {
+  return MenuItemModel.countDocuments({
+    vendorId: new Types.ObjectId(vendorId),
+    status: "approved",
+    isAvailable: true,
+  });
 }
 
 /** Simulates a pre-9.6 document that was paused via availability alone. */
@@ -737,5 +766,335 @@ describe("menu items", () => {
     expect(favorites.body.items).toEqual([
       expect.objectContaining({ id: active.body.id }),
     ]);
+  });
+
+  describe("atomic free-plan capacity", () => {
+    it("builds the mandatory unique active-slot index at startup and never exposes it", async () => {
+      const indexes = await MenuItemModel.collection.indexes();
+      const slotIndex = indexes.find(
+        (index) => index.name === "uniq_vendor_active_slot",
+      );
+      expect(slotIndex).toBeDefined();
+      expect(slotIndex?.unique).toBe(true);
+      expect(slotIndex?.key).toEqual({ vendorId: 1, activeSlot: 1 });
+
+      const vendor = await createTestUser({ role: "vendor" });
+      const created = await createItem(await authorizationFor(vendor));
+      expect(created.status).toBe(201);
+      expect(created.body).not.toHaveProperty("activeSlot");
+
+      const buildSpy = vi
+        .spyOn(MenuItemModel, "createIndexes")
+        .mockRejectedValueOnce(new Error("index build failed"));
+      try {
+        await expect(ensureMenuItemIndexes()).rejects.toThrow(
+          "index build failed",
+        );
+      } finally {
+        buildSpy.mockRestore();
+      }
+    });
+
+    it("allows only three of four concurrent approvals from an empty active set", async () => {
+      const vendor = await createTestUser({ role: "vendor" });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const adminAuth = await authorizationFor(admin);
+      const ids = await Promise.all(
+        [1, 2, 3, 4].map((n) => createPendingItem(vendorAuth, `Race ${n}`)),
+      );
+
+      const results = await Promise.all(
+        ids.map((id) => approveItem(adminAuth, id)),
+      );
+
+      expect(results.map((result) => result.status).sort()).toEqual([
+        200, 200, 200, 409,
+      ]);
+      expect(results.filter((result) => result.status === 409)[0].body.message).toContain(
+        "at most 3",
+      );
+      expect(await countActive(vendor.id)).toBe(3);
+      const slots = await MenuItemModel.find({
+        vendorId: new Types.ObjectId(vendor.id),
+        activeSlot: { $ne: null },
+      }).select("activeSlot");
+      expect(slots).toHaveLength(3);
+      expect(new Set(slots.map((item) => item.activeSlot)).size).toBe(3);
+    });
+
+    it("blocks one of two concurrent admin approvals at capacity", async () => {
+      const vendor = await createTestUser({ role: "vendor" });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const adminAuth = await authorizationFor(admin);
+      const active = await Promise.all(
+        [1, 2].map((n) => createPendingItem(vendorAuth, `Active ${n}`)),
+      );
+      for (const id of active) await approveItem(adminAuth, id).expect(200);
+
+      const pending = await Promise.all(
+        [1, 2].map((n) => createPendingItem(vendorAuth, `Pending ${n}`)),
+      );
+      const results = await Promise.all(
+        pending.map((id) => approveItem(adminAuth, id)),
+      );
+
+      expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
+      expect(await countActive(vendor.id)).toBe(3);
+    });
+
+    it("blocks one of two concurrent vendor reactivations at capacity", async () => {
+      const vendor = await createTestUser({ role: "vendor" });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const adminAuth = await authorizationFor(admin);
+      const ids = await Promise.all(
+        [1, 2, 3, 4].map((n) => createPendingItem(vendorAuth, `Toggle ${n}`)),
+      );
+      for (const id of ids.slice(0, 2)) await approveItem(adminAuth, id).expect(200);
+      for (const id of ids.slice(2)) {
+        await request(app)
+          .patch(`/api/menu-items/${id}`)
+          .set("Authorization", vendorAuth)
+          .send({ isAvailable: false })
+          .expect(200);
+        await approveItem(adminAuth, id).expect(200);
+      }
+
+      const results = await Promise.all(
+        [ids[2], ids[3]].map((id) =>
+          request(app)
+            .patch(`/api/menu-items/${id}`)
+            .set("Authorization", vendorAuth)
+            .send({ isAvailable: true }),
+        ),
+      );
+
+      expect(results.map((result) => result.status).sort()).toEqual([200, 409]);
+      expect(await countActive(vendor.id)).toBe(3);
+    });
+
+    it("frees capacity on deactivation and rejection, and rechecks on reapproval", async () => {
+      const vendor = await createTestUser({ role: "vendor" });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const adminAuth = await authorizationFor(admin);
+      const ids = await Promise.all(
+        [1, 2, 3, 4].map((n) => createPendingItem(vendorAuth, `Cycle ${n}`)),
+      );
+      for (const id of ids.slice(0, 3)) await approveItem(adminAuth, id).expect(200);
+
+      await request(app)
+        .patch(`/api/menu-items/${ids[0]}/status`)
+        .set("Authorization", adminAuth)
+        .send({ status: "inactive" })
+        .expect(200);
+      expect(await countActive(vendor.id)).toBe(2);
+      await approveItem(adminAuth, ids[3]).expect(200);
+      expect(await countActive(vendor.id)).toBe(3);
+
+      await request(app)
+        .patch(`/api/menu-items/${ids[1]}/status`)
+        .set("Authorization", adminAuth)
+        .send({ status: "rejected", reason: "Review" })
+        .expect(200);
+      expect(await countActive(vendor.id)).toBe(2);
+      await approveItem(adminAuth, ids[0]).expect(200);
+
+      const overCapacity = await approveItem(adminAuth, ids[1]);
+      expect(overCapacity.status).toBe(409);
+      expect(overCapacity.body.message).toContain("at most 3");
+    });
+
+    it("skips the capacity check when a vendor content edit returns an item to pending", async () => {
+      const vendor = await createTestUser({ role: "vendor" });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const adminAuth = await authorizationFor(admin);
+      const ids = await Promise.all(
+        [1, 2, 3, 4].map((n) => createPendingItem(vendorAuth, `Edit ${n}`)),
+      );
+      for (const id of ids.slice(0, 3)) await approveItem(adminAuth, id).expect(200);
+
+      const edited = await request(app)
+        .patch(`/api/menu-items/${ids[0]}`)
+        .set("Authorization", vendorAuth)
+        .send({ description: "A newly edited and detailed description for review." });
+      expect(edited.status).toBe(200);
+      expect(edited.body.status).toBe("pending");
+      expect(edited.body.isAvailable).toBe(true);
+      expect(await countActive(vendor.id)).toBe(2);
+
+      await approveItem(adminAuth, ids[3]).expect(200);
+      expect(await countActive(vendor.id)).toBe(3);
+      expect(
+        (await MenuItemModel.findById(ids[0]))?.activeSlot ?? null,
+      ).toBeNull();
+    });
+
+    it("repairs legacy unslotted active items and stale slots before claiming", async () => {
+      const vendor = await createTestUser({ role: "vendor" });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const adminAuth = await authorizationFor(admin);
+      const ids = await Promise.all(
+        [1, 2, 3, 4].map((n) => createPendingItem(vendorAuth, `Legacy ${n}`)),
+      );
+      for (const id of ids.slice(0, 3)) await approveItem(adminAuth, id).expect(200);
+
+      await MenuItemModel.updateMany(
+        { status: "approved", isAvailable: true },
+        { $set: { activeSlot: null } },
+      );
+      const blocked = await approveItem(adminAuth, ids[3]);
+      expect(blocked.status).toBe(409);
+      expect(await countActive(vendor.id)).toBe(3);
+
+      await request(app)
+        .patch(`/api/menu-items/${ids[0]}/status`)
+        .set("Authorization", adminAuth)
+        .send({ status: "inactive" })
+        .expect(200);
+      await MenuItemModel.updateOne(
+        { _id: new Types.ObjectId(ids[0]) },
+        { $set: { activeSlot: 2 } },
+      );
+      await approveItem(adminAuth, ids[3]).expect(200);
+      expect((await MenuItemModel.findById(ids[0]))?.activeSlot ?? null).toBeNull();
+      expect((await MenuItemModel.findById(ids[3]))?.activeSlot).toEqual(
+        expect.any(Number),
+      );
+    });
+
+    it("does not swallow non-duplicate database errors", async () => {
+      const vendor = await createTestUser({ role: "vendor" });
+      const admin = await createTestUser({ role: "admin" });
+      const id = await createPendingItem(await authorizationFor(vendor), "DB Error Item");
+
+      const spy = vi
+        .spyOn(MenuItemModel, "findOneAndUpdate")
+        .mockRejectedValueOnce(new Error("simulated database failure"));
+      try {
+        const response = await approveItem(await authorizationFor(admin), id);
+        expect(response.status).toBe(500);
+        expect((await MenuItemModel.findById(id))?.status).toBe("pending");
+      } finally {
+        spy.mockRestore();
+      }
+    });
+
+    it("returns a conflict instead of overwriting a concurrent edit of one item", async () => {
+      const vendor = await createTestUser({ role: "vendor" });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const id = await createPendingItem(vendorAuth, "Same Item Race");
+      await approveItem(await authorizationFor(admin), id).expect(200);
+
+      const [first, second] = await Promise.all([
+        request(app)
+          .patch(`/api/menu-items/${id}`)
+          .set("Authorization", vendorAuth)
+          .send({ itemName: "Renamed Item" }),
+        request(app)
+          .patch(`/api/menu-items/${id}`)
+          .set("Authorization", vendorAuth)
+          .send({ description: "A concurrent replacement description for this item." }),
+      ]);
+
+      expect([first.status, second.status].sort()).toEqual([200, 409]);
+    });
+  });
+
+  describe("premium expiry boundary", () => {
+    it("allows unlimited concurrent activations while Premium is active", async () => {
+      const vendor = await createTestUser({
+        role: "vendor",
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: new Date(Date.now() + 86_400_000),
+      });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const adminAuth = await authorizationFor(admin);
+      const ids = await Promise.all(
+        [1, 2, 3, 4].map((n) => createPendingItem(vendorAuth, `Premium ${n}`)),
+      );
+
+      const results = await Promise.all(
+        ids.map((id) => approveItem(adminAuth, id)),
+      );
+      expect(results.every((result) => result.status === 200)).toBe(true);
+      expect(await countActive(vendor.id)).toBe(4);
+    });
+
+    it("applies the free-plan cap after expiry without deactivating existing items", async () => {
+      const vendor = await createTestUser({
+        role: "vendor",
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: new Date(Date.now() + 86_400_000),
+      });
+      const admin = await createTestUser({ role: "admin" });
+      const vendorAuth = await authorizationFor(vendor);
+      const adminAuth = await authorizationFor(admin);
+      const ids = await Promise.all(
+        [1, 2, 3, 4, 5].map((n) => createPendingItem(vendorAuth, `Downgrade ${n}`)),
+      );
+      for (const id of ids) await approveItem(adminAuth, id).expect(200);
+
+      await updateUser(vendor.id, {
+        subscriptionExpiresAt: new Date(Date.now() - 1_000),
+      });
+      const blocked = await approveItem(
+        adminAuth,
+        await createPendingItem(vendorAuth, "After Downgrade"),
+      );
+      expect(blocked.status).toBe(409);
+      expect(await countActive(vendor.id)).toBe(5);
+
+      for (const id of ids.slice(0, 2)) {
+        await request(app)
+          .patch(`/api/menu-items/${id}/status`)
+          .set("Authorization", adminAuth)
+          .send({ status: "inactive" })
+          .expect(200);
+      }
+      const stillBlocked = await approveItem(
+        adminAuth,
+        await createPendingItem(vendorAuth, "Still Over Limit"),
+      );
+      expect(stillBlocked.status).toBe(409);
+
+      await request(app)
+        .patch(`/api/menu-items/${ids[2]}/status`)
+        .set("Authorization", adminAuth)
+        .send({ status: "inactive" })
+        .expect(200);
+      const allowed = await approveItem(
+        adminAuth,
+        await createPendingItem(vendorAuth, "Back Under Limit"),
+      );
+      expect(allowed.status).toBe(200);
+      expect(await countActive(vendor.id)).toBe(3);
+    });
+
+    it("treats an expired subscription as free at the exact boundary", async () => {
+      const vendor = await createTestUser({
+        role: "vendor",
+        subscriptionPlan: "premium",
+        subscriptionExpiresAt: new Date(Date.now() - 1),
+      });
+      const admin = await createTestUser({ role: "admin" });
+      const ids = await Promise.all(
+        [1, 2, 3, 4].map(async (n) =>
+          createPendingItem(await authorizationFor(vendor), `Expired ${n}`),
+        ),
+      );
+      const results = await Promise.all(
+        ids.map(async (id) => approveItem(await authorizationFor(admin), id)),
+      );
+      expect(results.map((result) => result.status).sort()).toEqual([
+        200, 200, 200, 409,
+      ]);
+    });
   });
 });

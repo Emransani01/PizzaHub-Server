@@ -7,7 +7,7 @@
  * `config/environment.ts` reads them at module-evaluation time.
  */
 import { afterAll } from "vitest";
-import { MongoMemoryServer } from "mongodb-memory-server";
+import { MongoMemoryReplSet } from "mongodb-memory-server";
 
 process.env.NODE_ENV = "test";
 process.env.CLIENT_URL = "http://localhost:3000";
@@ -19,7 +19,11 @@ process.env.STRIPE_SECRET_KEY = "sk_test_pizzahub_local_only";
 process.env.STRIPE_WEBHOOK_SECRET = "whsec_pizzahub_local_only";
 process.env.STRIPE_PREMIUM_PRICE_ID = "price_test_premium";
 
-const mongod = await MongoMemoryServer.create();
+// Checkout uses multi-document transactions, so the in-memory database must be
+// a replica set with WiredTiger rather than a standalone mongod.
+const mongod = await MongoMemoryReplSet.create({
+  replSet: { count: 1, storageEngine: "wiredTiger" },
+});
 process.env.MONGODB_URI = mongod.getUri("pizzahub_test");
 
 const { connectDatabase, disconnectDatabase } = await import(
